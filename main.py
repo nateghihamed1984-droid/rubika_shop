@@ -2,6 +2,11 @@ from rubka import Robot, Message
 from rubka.keypad import ChatKeypadBuilder
 import sqlite3
 import os
+import asyncio
+import threading
+import json
+import urllib.request
+import base64
 from datetime import datetime, timedelta
 
 try:
@@ -11,614 +16,1121 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
+# ============================================================
+# SECURITY / CONFIGURATION
+# ============================================================
 TOKEN = "CFFHIC0ZOTGPALAPFBHEWCNUDYSNDTKTENGOAULXCZPLZRSBYTHFVPMKUWLMEPHM"
 ADMIN_CHAT_ID = "b0BC4FX0BHkJ080af57b490e17163d49"
+
 DB_PATH = "shop.db"
-PRODUCT_CODE = "P-001"
-PRODUCT_IMAGE_PATH = "product_p001.jpg"
+PRODUCT_IMAGE_PATH = "product_default.jpg"
 FREE_DELIVERY_CITY = "تبریز"
 RECENT_ORDER_DAYS = 7
 RECENT_ORDER_THRESHOLD = 3
 RETURN_WINDOW_HOURS = 24
 EXCHANGE_WINDOW_HOURS = 72
-
-DEFAULT_PRODUCT = {
-    "code": PRODUCT_CODE,
-    "name": "محصول نمونه",
-    "description": "توضیحات محصول را اینجا وارد کنید.",
-    "price": "1500000",
-    "delivery_days": "1 تا 3",
-    "image_path": PRODUCT_IMAGE_PATH,
-    "active": 1,
-}
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
-
-def cols(table):
-    cursor.execute(f"PRAGMA table_info({table})")
-    return [r[1] for r in cursor.fetchall()]
-
-def addcol(table, name, definition):
-    if name not in cols(table):
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-        conn.commit()
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS orders(
- id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT,product TEXT,name TEXT,phone TEXT,
- address TEXT,status TEXT)""")
-for n,d in [
- ("chat_id","TEXT"),("created_at","TEXT"),("delivered_at","TEXT"),
- ("accepted_at","TEXT"),("customer_acceptance","TEXT")]: addcol("orders",n,d)
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS products(
- id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT UNIQUE,name TEXT,description TEXT,
- price TEXT,delivery_days TEXT,image_path TEXT,active INTEGER DEFAULT 1)""")
-addcol("products","image_file_id","TEXT")
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS reviews(
- id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER,user_id TEXT,product TEXT,
- rating INTEGER,comment TEXT,created_at TEXT)""")
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS return_requests(
- id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER UNIQUE,user_id TEXT,product TEXT,
- request_type TEXT,reason TEXT,status TEXT,created_at TEXT,decided_at TEXT,admin_note TEXT)""")
-
-# New after-sales fields are added without destroying existing databases.
-for n,d in [
- ("return_deadline","TEXT"),("customer_name","TEXT"),("phone","TEXT"),
- ("exchange_product","TEXT"),("exchange_difference","TEXT"),
- ("refund_amount","TEXT"),("bank_account_name","TEXT"),("card_number","TEXT"),
- ("iban","TEXT"),("bank_name","TEXT"),("paid_at","TEXT"),("exchange_delivery_days","TEXT"),("exchange_sent_at","TEXT"),("exchange_received_at","TEXT"),("exchange_customer_acceptance","TEXT"),("exchange_round","INTEGER DEFAULT 1")]:
-    addcol("return_requests",n,d)
-
-cursor.execute("SELECT id FROM products WHERE code=?",(PRODUCT_CODE,))
-if not cursor.fetchone():
-    cursor.execute("""INSERT INTO products(code,name,description,price,delivery_days,image_path,active)
-                     VALUES(?,?,?,?,?,?,?)""", tuple(DEFAULT_PRODUCT.values()))
-    conn.commit()
+WEBSITE_BASE_URL = "https://nateghihamed1984-droid.github.io/SABALAN-SHOP/"
+WEBSITE_API_URL = "http://127.0.0.1:8000/api/orders"
+WEBSITE_SYNC_INTERVAL = 3
 
 bot = Robot(token=TOKEN)
+BOT_LOOP = None
+
 customers = {}
 rating_comments = {}
 admin_states = {}
 after_sales_states = {}
 
+# ============================================================
+# DATABASE
+# ============================================================
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def now_string(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def parse_dt(v):
-    try: return datetime.strptime(v,"%Y-%m-%d %H:%M:%S") if v else None
-    except: return None
-def get_user_id(m): return getattr(m,"sender_id",None)
-def get_chat_id(m): return getattr(m,"chat_id",None)
-def is_admin(m): return get_chat_id(m)==ADMIN_CHAT_ID
-def button_id(m):
-    try: return m.aux_data.button_id
-    except: return None
 
-def norm(v):
-    return str(v or "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩","01234567890123456789"))
-def price(v):
-    try: return f"{int(norm(v)):,}"
-    except: return str(v or "نامشخص")
-def product():
-    cursor.execute("SELECT code,name,description,price,delivery_days,image_path,image_file_id FROM products WHERE code=? AND active=1",(PRODUCT_CODE,))
-    return cursor.fetchone()
-def admin_product():
-    cursor.execute("SELECT code,name,description,price,delivery_days,image_path,image_file_id,active FROM products WHERE code=?",(PRODUCT_CODE,))
-    return cursor.fetchone()
-def deadline(accepted, hours=RETURN_WINDOW_HOURS):
-    d=parse_dt(accepted); return d+timedelta(hours=hours) if d else None
+def now_string():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def status_fa(s):
-    return {"جدید":"🆕 جدید","تأیید شده":"✅ تأیید شده","لغو شده":"❌ لغو شده","تحویل شده":"🚚 تحویل شده","تحویل و تأیید شده":"📦 تحویل و تأیید شده","تعویض انجام شد":"🔄 تعویض انجام شد","مرجوع و وجه بازگشت داده شد":"💰 مرجوع و وجه بازگشت داده شد"}.get(s,s or "نامشخص")
-def after_status(s):
-    return {"در انتظار بررسی":"🟡 در انتظار بررسی","تأیید شده":"✅ تأیید شده","رد شده":"❌ رد شده","در حال تعویض":"🔄 در حال تعویض","تعویض انجام شد":"✅ تعویض انجام شد","کالای تعویضی ارسال شد":"📦 کالای تعویضی ارسال شد","در انتظار تأیید دریافت تعویضی":"🕐 در انتظار تأیید دریافت تعویضی","در انتظار بررسی مجدد":"🟡 در انتظار بررسی مجدد","در انتظار اطلاعات بانکی":"🏦 در انتظار اطلاعات بانکی","در انتظار واریز":"💰 در انتظار واریز","وجه واریز شد":"✅ وجه واریز شد","تکمیل شده":"✅ تکمیل شده"}.get(s,s or "نامشخص")
 
-def main_menu():
-    return (ChatKeypadBuilder().row(ChatKeypadBuilder().button(id="show_products",text="📦 مشاهده محصولات"))
-      .row(ChatKeypadBuilder().button(id="my_orders",text="📋 مشاهده سفارش‌ها"))
-      .row(ChatKeypadBuilder().button(id="shop_policy",text="📜 شرایط تعویض و مرجوعی")).build())
-def product_menu():
-    return (ChatKeypadBuilder().row(ChatKeypadBuilder().button(id="order_product_P-001",text="🛒 ثبت سفارش"))
-      .row(ChatKeypadBuilder().button(id="main_menu",text="🔙 منوی اصلی")).build())
-def confirm_menu():
-    return ChatKeypadBuilder().row(ChatKeypadBuilder().button(id="customer_confirm_order",text="✅ تأیید سفارش"),ChatKeypadBuilder().button(id="customer_cancel_order",text="❌ لغو سفارش")).build()
-def accept_menu(oid):
-    return ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"customer_accept_delivery_{oid}",text="✅ کالا را رویت کردم و سالم و مطابق سفارش تحویل گرفتم")).build()
-def order_admin_menu(oid):
-    return (ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"admin_confirm_{oid}",text="✅ تأیید سفارش"),ChatKeypadBuilder().button(id=f"admin_cancel_{oid}",text="❌ لغو سفارش"))
-      .row(ChatKeypadBuilder().button(id=f"admin_deliver_{oid}",text="🚚 تحویل شد")).build())
-def return_admin_menu(rid,typ,status="در انتظار بررسی"):
-    b=ChatKeypadBuilder()
-    if status in ("در انتظار بررسی","در انتظار بررسی مجدد"):
-        return b.row(ChatKeypadBuilder().button(id=f"admin_after_approve_{rid}",text="✅ تأیید درخواست"),ChatKeypadBuilder().button(id=f"admin_after_reject_{rid}",text="❌ رد درخواست")).build()
-    if typ=="مرجوعی و بازگشت وجه" and status=="در انتظار واریز":
-        return b.row(ChatKeypadBuilder().button(id=f"admin_refund_paid_{rid}",text="💰 ثبت واریز وجه")).build()
-    if typ=="تعویض" and status=="در حال تعویض":
-        return b.row(ChatKeypadBuilder().button(id=f"admin_exchange_sent_{rid}",text="📦 ارسال کالای تعویضی")).build()
-    if typ=="تعویض" and status=="در انتظار تأیید دریافت تعویضی":
-        return b.row(ChatKeypadBuilder().button(id=f"admin_exchange_done_{rid}",text="🔄 ثبت نهایی تعویض")).build()
-    return b.build()
-def customer_after_menu(oid, exchange=False):
-    # منوی تصمیم پس از تحویل اولیه یا تحویل کالای تعویضی
-    title = "⭐ راضی هستم؛ ثبت امتیاز و نظر"
-    return (ChatKeypadBuilder().row(
-                ChatKeypadBuilder().button(id=f"customer_rate_{oid}",text=title)
+def parse_dt(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S") if value else None
+    except Exception:
+        return None
+
+
+def norm(value):
+    return str(value or "").translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    )
+
+
+def price(value):
+    try:
+        return f"{int(norm(value)):,}"
+    except Exception:
+        return str(value or "نامشخص")
+
+
+def ensure_column(conn, table, name, definition):
+    columns = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def init_db():
+    conn = get_db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS categories(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_id INTEGER,
+            name TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            name TEXT,
+            description TEXT,
+            price TEXT,
+            delivery_days TEXT,
+            image_path TEXT,
+            image_file_id TEXT,
+            category_id INTEGER,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            chat_id TEXT,
+            product TEXT,
+            name TEXT,
+            phone TEXT,
+            province TEXT,
+            city TEXT,
+            address TEXT,
+            status TEXT,
+            created_at TEXT,
+            delivered_at TEXT,
+            accepted_at TEXT,
+            customer_acceptance TEXT,
+            website_order_id INTEGER,
+            website_customer_ref TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reviews(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER,
+            user_id TEXT,
+            product TEXT,
+            rating INTEGER,
+            comment TEXT,
+            created_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS return_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER UNIQUE,
+            user_id TEXT,
+            product TEXT,
+            request_type TEXT,
+            reason TEXT,
+            status TEXT,
+            created_at TEXT,
+            decided_at TEXT,
+            admin_note TEXT,
+            return_deadline TEXT,
+            customer_name TEXT,
+            phone TEXT,
+            exchange_product TEXT,
+            exchange_difference TEXT,
+            refund_amount TEXT,
+            bank_account_name TEXT,
+            card_number TEXT,
+            iban TEXT,
+            bank_name TEXT,
+            paid_at TEXT,
+            exchange_delivery_days TEXT,
+            exchange_sent_at TEXT,
+            exchange_received_at TEXT,
+            exchange_customer_acceptance TEXT,
+            exchange_round INTEGER DEFAULT 1
+        )
+    """)
+
+    # Migration for databases made by previous versions.
+    for table, fields in {
+        "orders": [
+            ("chat_id", "TEXT"), ("created_at", "TEXT"), ("delivered_at", "TEXT"),
+            ("accepted_at", "TEXT"), ("customer_acceptance", "TEXT"),
+            ("website_order_id", "INTEGER"), ("website_customer_ref", "TEXT"),
+            ("province", "TEXT"), ("city", "TEXT")
+        ],
+        "products": [
+            ("image_file_id", "TEXT"), ("category_id", "INTEGER"),
+            ("created_at", "TEXT")
+        ],
+        "return_requests": [
+            ("return_deadline", "TEXT"), ("customer_name", "TEXT"), ("phone", "TEXT"),
+            ("exchange_product", "TEXT"), ("exchange_difference", "TEXT"),
+            ("refund_amount", "TEXT"), ("bank_account_name", "TEXT"),
+            ("card_number", "TEXT"), ("iban", "TEXT"), ("bank_name", "TEXT"),
+            ("paid_at", "TEXT"), ("exchange_delivery_days", "TEXT"),
+            ("exchange_sent_at", "TEXT"), ("exchange_received_at", "TEXT"),
+            ("exchange_customer_acceptance", "TEXT"), ("exchange_round", "INTEGER DEFAULT 1")
+        ]
+    }.items():
+        for name, definition in fields:
+            ensure_column(conn, table, name, definition)
+
+    # Default category structure. These are only created once.
+    defaults = [
+        (None, "پوشاک"),
+        (None, "کفش"),
+        (None, "اکسسوری و زیورآلات"),
+        (None, "طلا"),
+        (None, "عطر و ادکلن"),
+    ]
+    for parent, name in defaults:
+        exists = conn.execute(
+            "SELECT id FROM categories WHERE parent_id IS NULL AND name=?", (name,)
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO categories(parent_id,name,active,sort_order,created_at) VALUES(?,?,?,?,?)",
+                (parent, name, 1, 0, now_string())
             )
-            .row(
-                ChatKeypadBuilder().button(id=f"customer_exchange_{oid}",text="🔄 مجدداً درخواست تعویض" if exchange else "🔄 درخواست تعویض"),
-                ChatKeypadBuilder().button(id=f"customer_refund_{oid}",text="💰 مرجوعی و بازگشت وجه")
-            ).build())
+
+    clothing = conn.execute(
+        "SELECT id FROM categories WHERE parent_id IS NULL AND name='پوشاک'"
+    ).fetchone()
+    shoes = conn.execute(
+        "SELECT id FROM categories WHERE parent_id IS NULL AND name='کفش'"
+    ).fetchone()
+    perfume = conn.execute(
+        "SELECT id FROM categories WHERE parent_id IS NULL AND name='عطر و ادکلن'"
+    ).fetchone()
+    if clothing:
+        for name in ("مردانه", "زنانه", "بچگانه"):
+            if not conn.execute("SELECT id FROM categories WHERE parent_id=? AND name=?", (clothing[0], name)).fetchone():
+                conn.execute("INSERT INTO categories(parent_id,name,active,created_at) VALUES(?,?,1,?)", (clothing[0], name, now_string()))
+    if shoes:
+        for name in ("مردانه", "زنانه", "بچگانه"):
+            if not conn.execute("SELECT id FROM categories WHERE parent_id=? AND name=?", (shoes[0], name)).fetchone():
+                conn.execute("INSERT INTO categories(parent_id,name,active,created_at) VALUES(?,?,1,?)", (shoes[0], name, now_string()))
+    if perfume:
+        for name in ("مردانه", "زنانه", "یونیسکس"):
+            if not conn.execute("SELECT id FROM categories WHERE parent_id=? AND name=?", (perfume[0], name)).fetchone():
+                conn.execute("INSERT INTO categories(parent_id,name,active,created_at) VALUES(?,?,1,?)", (perfume[0], name, now_string()))
+
+    # Keep P-001 from the old system so existing customers/orders remain compatible.
+    if not conn.execute("SELECT id FROM products WHERE code='P-001'").fetchone():
+        conn.execute("""
+            INSERT INTO products(code,name,description,price,delivery_days,image_path,active,created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            "P-001", "محصول نمونه", "توضیحات محصول را اینجا وارد کنید.",
+            "1500000", "1 تا 3", PRODUCT_IMAGE_PATH, 1, now_string()
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# COMMON HELPERS
+# ============================================================
+def get_user_id(message):
+    return getattr(message, "sender_id", None)
+
+
+def get_chat_id(message):
+    return getattr(message, "chat_id", None)
+
+
+def is_admin(message):
+    return get_chat_id(message) == ADMIN_CHAT_ID
+
+
+def button_id(message):
+    try:
+        return message.aux_data.button_id
+    except Exception:
+        return None
+
+
+def make_customer_ref(chat_id):
+    raw = str(chat_id or "").encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def website_order_link(chat_id, product_code):
+    ref = make_customer_ref(chat_id)
+    return f"{WEBSITE_BASE_URL}landing.html?product={product_code}&customer_ref={ref}"
+
+
+def deadline(accepted, hours=RETURN_WINDOW_HOURS):
+    dt = parse_dt(accepted)
+    return dt + timedelta(hours=hours) if dt else None
+
+
+def status_fa(status):
+    return {
+        "جدید": "🆕 جدید",
+        "تأیید شده": "✅ تأیید شده",
+        "لغو شده": "❌ لغو شده",
+        "تحویل شده": "🚚 تحویل شده",
+        "تحویل و تأیید شده": "📦 تحویل و تأیید شده",
+        "تعویض انجام شد": "🔄 تعویض انجام شد",
+        "مرجوع و وجه بازگشت داده شد": "💰 مرجوع و وجه بازگشت داده شد",
+    }.get(status, status or "نامشخص")
+
+
+def after_status(status):
+    return {
+        "در انتظار بررسی": "🟡 در انتظار بررسی",
+        "در انتظار بررسی مجدد": "🟡 در انتظار بررسی مجدد",
+        "تأیید شده": "✅ تأیید شده",
+        "رد شده": "❌ رد شده",
+        "در حال تعویض": "🔄 در حال تعویض",
+        "کالای تعویضی ارسال شد": "📦 کالای تعویضی ارسال شد",
+        "در انتظار تأیید دریافت تعویضی": "🕐 در انتظار تأیید دریافت تعویضی",
+        "تعویض انجام شد": "✅ تعویض انجام شد",
+        "در انتظار واریز": "💰 در انتظار واریز",
+        "وجه واریز شد": "✅ وجه واریز شد",
+        "تکمیل شده": "✅ تکمیل شده",
+    }.get(status, status or "نامشخص")
+
+
+def get_product(code):
+    conn = get_db()
+    row = conn.execute("""
+        SELECT p.*, c.name AS category_name
+        FROM products p
+        LEFT JOIN categories c ON c.id=p.category_id
+        WHERE p.code=? AND p.active=1
+    """, (code,)).fetchone()
+    conn.close()
+    return row
+
+
+def get_admin_product(code):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM products WHERE code=?", (code,)).fetchone()
+    conn.close()
+    return row
+
+
+def get_product_stats(code):
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM orders WHERE product=?", (code,)).fetchone()[0]
+    avg, count = conn.execute("SELECT AVG(rating),COUNT(*) FROM reviews WHERE product=?", (code,)).fetchone()
+    conn.close()
+    return total, round(avg or 0, 1), count
+
+# ============================================================
+# KEYPADS
+# ============================================================
+def main_menu():
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id="show_categories", text="🗂 مشاهده دسته‌بندی محصولات"))
+        .row(ChatKeypadBuilder().button(id="my_orders", text="📋 سفارش‌های من"),
+             ChatKeypadBuilder().button(id="shop_policy", text="📜 شرایط فروش و خدمات پس از فروش"))
+        .build())
+
+
+def product_menu(code):
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id=f"order_product_{code}", text="🛒 ادامه خرید این محصول"))
+        .row(ChatKeypadBuilder().button(id="show_categories", text="🗂 سایر محصولات"))
+        .row(ChatKeypadBuilder().button(id="main_menu", text="🏠 منوی اصلی"))
+        .build())
+
+
+def category_menu(parent_id=0):
+    conn = get_db()
+    if parent_id:
+        rows = conn.execute("SELECT id,name FROM categories WHERE parent_id=? AND active=1 ORDER BY sort_order,id", (parent_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT id,name FROM categories WHERE parent_id IS NULL AND active=1 ORDER BY sort_order,id").fetchall()
+    conn.close()
+    builder = ChatKeypadBuilder()
+    for row in rows:
+        builder.row(ChatKeypadBuilder().button(id=f"cat_{row['id']}", text=f"📂 {row['name']}"))
+    if parent_id:
+        builder.row(ChatKeypadBuilder().button(id="show_categories", text="↩️ دسته‌بندی‌های اصلی"))
+    builder.row(ChatKeypadBuilder().button(id="main_menu", text="🏠 منوی اصلی"))
+    return builder.build()
+
+
+def products_in_category_menu(category_id):
+    conn = get_db()
+    rows = conn.execute("SELECT code,name FROM products WHERE category_id=? AND active=1 ORDER BY id DESC", (category_id,)).fetchall()
+    parent = conn.execute("SELECT parent_id FROM categories WHERE id=?", (category_id,)).fetchone()
+    conn.close()
+    builder = ChatKeypadBuilder()
+    for row in rows:
+        builder.row(ChatKeypadBuilder().button(id=f"view_product_{row['code']}", text=f"📦 {row['code']} | {row['name']}"))
+    if not rows:
+        # The caller sends the explanatory message separately.
+        pass
+    if parent and parent[0]:
+        builder.row(ChatKeypadBuilder().button(id=f"cat_{parent[0]}", text="↩️ زیر‌دسته قبلی"))
+    else:
+        builder.row(ChatKeypadBuilder().button(id="show_categories", text="↩️ دسته‌بندی‌ها"))
+    builder.row(ChatKeypadBuilder().button(id="main_menu", text="🏠 منوی اصلی"))
+    return builder.build(), rows
+
+
+def confirm_menu():
+    return ChatKeypadBuilder().row(
+        ChatKeypadBuilder().button(id="customer_confirm_order", text="✅ تأیید سفارش"),
+        ChatKeypadBuilder().button(id="customer_cancel_order", text="❌ لغو سفارش")
+    ).build()
+
+
+def accept_menu(oid):
+    return ChatKeypadBuilder().row(
+        ChatKeypadBuilder().button(id=f"customer_accept_delivery_{oid}", text="✅ کالا را رویت کردم و تحویل گرفتم")
+    ).build()
+
+
+def order_admin_menu(oid):
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id=f"admin_confirm_{oid}", text="✅ تأیید سفارش"),
+             ChatKeypadBuilder().button(id=f"admin_cancel_{oid}", text="❌ لغو سفارش"))
+        .row(ChatKeypadBuilder().button(id=f"admin_deliver_{oid}", text="🚚 ثبت تحویل"))
+        .build())
+
+
+def customer_after_menu(oid, exchange=False):
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id=f"customer_rate_{oid}", text="⭐ رضایت دارم؛ امتیاز و نظر"))
+        .row(ChatKeypadBuilder().button(id=f"customer_exchange_{oid}", text="🔄 مجدداً درخواست تعویض" if exchange else "🔄 درخواست تعویض"),
+             ChatKeypadBuilder().button(id=f"customer_refund_{oid}", text="💰 مرجوعی و بازگشت وجه"))
+        .build())
+
 
 def exchange_accept_menu(rid):
-    return ChatKeypadBuilder().row(
-        ChatKeypadBuilder().button(id=f"customer_accept_exchange_{rid}",text="✅ کالای تعویضی را دریافت کردم")
-    ).build()
+    return ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"customer_accept_exchange_{rid}", text="✅ کالای تعویضی را دریافت کردم")).build()
+
 
 def refund_accept_menu(rid):
-    return ChatKeypadBuilder().row(
-        ChatKeypadBuilder().button(id=f"customer_accept_refund_{rid}",text="✅ دریافت وجه را تأیید می‌کنم")
-    ).build()
+    return ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"customer_accept_refund_{rid}", text="✅ دریافت وجه را تأیید می‌کنم")).build()
+
+
 def admin_menu():
-    # پنل اصلی مدیر به دو بخش واضح تقسیم شده است:
-    # ۱) امور مشتریان و سفارش‌ها
-    # ۲) مدیریت محصولات
-    # گزارش Excel نیز مستقیماً در همین پنل اصلی در دسترس است.
     return (ChatKeypadBuilder()
-      .row(
-          ChatKeypadBuilder().button(id="admin_customer_panel",text="👤 امور مشتریان"),
-          ChatKeypadBuilder().button(id="admin_products",text="🛠 مدیریت محصولات")
-      )
-      .row(ChatKeypadBuilder().button(id="admin_export_orders",text="📊 دریافت گزارش Excel"))
-      .build())
+        .row(ChatKeypadBuilder().button(id="admin_customer_panel", text="👤 امور مشتریان"),
+             ChatKeypadBuilder().button(id="admin_categories", text="🗂 دسته‌بندی‌ها"))
+        .row(ChatKeypadBuilder().button(id="admin_products", text="📦 مدیریت محصولات"))
+        .row(ChatKeypadBuilder().button(id="admin_export_orders", text="📊 گزارش Excel"))
+        .build())
+
+
 def admin_customer_menu():
     return (ChatKeypadBuilder()
-      .row(ChatKeypadBuilder().button(id="admin_orders",text="📋 مشاهده سفارش‌ها"))
-      .row(ChatKeypadBuilder().button(id="admin_after_sales",text="🔄 تعویض و بازگشت وجه"))
-      .row(ChatKeypadBuilder().button(id="admin_export_orders",text="📊 دریافت گزارش Excel"))
-      .row(ChatKeypadBuilder().button(id="admin_back",text="🔙 بازگشت به پنل اصلی"))
-      .build())
+        .row(ChatKeypadBuilder().button(id="admin_orders", text="📦 سفارش‌ها"),
+             ChatKeypadBuilder().button(id="admin_after_sales", text="🔄 خدمات پس از فروش"))
+        .row(ChatKeypadBuilder().button(id="admin_export_orders", text="📊 گزارش Excel"))
+        .row(ChatKeypadBuilder().button(id="admin_back", text="🏠 بازگشت به صفحه اصلی"))
+        .build())
+
+
+def admin_categories_menu():
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id="admin_category_add", text="➕ افزودن دسته اصلی"))
+        .row(ChatKeypadBuilder().button(id="admin_subcategory_add", text="➕ افزودن زیر‌دسته"))
+        .row(ChatKeypadBuilder().button(id="admin_category_list", text="📋 مشاهده دسته‌ها"))
+        .row(ChatKeypadBuilder().button(id="admin_back", text="🏠 بازگشت به صفحه اصلی"))
+        .build())
+
+
 def admin_products_menu():
-    p=admin_product(); active=p[7] if p else 0
-    t="🔴 غیرفعال کردن P-001" if active else "🟢 فعال کردن P-001"
-    return (ChatKeypadBuilder().row(ChatKeypadBuilder().button(id="admin_price_P-001",text="💰 تغییر قیمت P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_name_P-001",text="📝 تغییر نام P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_description_P-001",text="📄 تغییر توضیحات P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_image_P-001",text="🖼 تغییر تصویر P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_delivery_P-001",text="⏱ تغییر زمان ارسال P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_toggle_P-001",text=t))
-      .row(ChatKeypadBuilder().button(id="admin_product_info_P-001",text="📋 مشخصات کامل P-001"))
-      .row(ChatKeypadBuilder().button(id="admin_back",text="🔙 بازگشت")).build())
+    return (ChatKeypadBuilder()
+        .row(ChatKeypadBuilder().button(id="admin_product_add", text="➕ افزودن محصول"))
+        .row(ChatKeypadBuilder().button(id="admin_product_list", text="📋 محصولات"))
+        .row(ChatKeypadBuilder().button(id="admin_back", text="🏠 بازگشت به صفحه اصلی"))
+        .build())
+
+
+def return_admin_menu(rid, typ, status="در انتظار بررسی"):
+    b = ChatKeypadBuilder()
+    if status in ("در انتظار بررسی", "در انتظار بررسی مجدد"):
+        b.row(ChatKeypadBuilder().button(id=f"admin_after_approve_{rid}", text="✅ تأیید درخواست"),
+              ChatKeypadBuilder().button(id=f"admin_after_reject_{rid}", text="❌ رد درخواست"))
+    elif typ == "مرجوعی و بازگشت وجه" and status == "در انتظار واریز":
+        b.row(ChatKeypadBuilder().button(id=f"admin_refund_paid_{rid}", text="💰 ثبت واریز وجه"))
+    elif typ == "تعویض" and status == "در حال تعویض":
+        b.row(ChatKeypadBuilder().button(id=f"admin_exchange_sent_{rid}", text="📦 ثبت ارسال کالای تعویضی"))
+    b.row(ChatKeypadBuilder().button(id="admin_customer_panel", text="↩️ امور مشتریان"))
+    b.row(ChatKeypadBuilder().button(id="admin_back", text="🏠 بازگشت به صفحه اصلی"))
+    return b.build()
+
+
 def rating_menu(oid):
-    return (ChatKeypadBuilder().row(*[ChatKeypadBuilder().button(id=f"rating_{oid}_{i}",text=f"⭐ {i}") for i in (1,2,3)])
-      .row(ChatKeypadBuilder().button(id=f"rating_{oid}_4",text="⭐ 4"),ChatKeypadBuilder().button(id=f"rating_{oid}_5",text="⭐ 5")).build())
+    return (ChatKeypadBuilder()
+        .row(*[ChatKeypadBuilder().button(id=f"rating_{oid}_{i}", text=f"⭐ {i}") for i in (1, 2, 3)])
+        .row(ChatKeypadBuilder().button(id=f"rating_{oid}_4", text="⭐ 4"),
+             ChatKeypadBuilder().button(id=f"rating_{oid}_5", text="⭐ 5"))
+        .build())
+
+# ============================================================
+# PRODUCT DISPLAY
+# ============================================================
+def build_product_text(code):
+    p = get_product(code)
+    if not p:
+        return "❌ محصول موردنظر پیدا نشد."
+    total, avg, review_count = get_product_stats(code)
+    conn = get_db()
+    recent_since = (datetime.now() - timedelta(days=RECENT_ORDER_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    recent = conn.execute("SELECT COUNT(*) FROM orders WHERE product=? AND created_at>=?", (code, recent_since)).fetchone()[0]
+    conn.close()
+
+    text = (
+        f"🏪 سبلان شاپ | از دل آذربایجان تا خانه شما\n\n"
+        f"📦 کد محصول: {p['code']}\n"
+        f"🔹 نام محصول: {p['name']}\n\n"
+        f"📝 توضیحات:\n{p['description'] or '-'}\n\n"
+        f"💰 قیمت: {price(p['price'])} تومان\n\n"
+        f"🛒 تعداد سفارش ثبت‌شده: {total}\n"
+    )
+    if recent >= RECENT_ORDER_THRESHOLD:
+        text += "🔥 این محصول اخیراً مورد توجه مشتریان بوده است.\n"
+    text += (
+        f"\n🚚 ارسال رایگان فقط در محدوده شهر {FREE_DELIVERY_CITY}\n"
+        "📦 ارسال به سایر نقاط کشور با احتساب هزینه پستی\n"
+        f"⏱ زمان تقریبی ارسال: {p['delivery_days'] or '-'} روز کاری\n"
+        "🏠 پرداخت درب منزل پس از رویت و تحویل کالا\n\n"
+        f"⭐ امتیاز مشتریان: {avg} / 5\n"
+        f"💬 تعداد نظر ثبت‌شده: {review_count}\n\n"
+        "برای ادامه خرید از دکمه زیر استفاده کنید."
+    )
+    return text
 
 
-def build_product_text():
-    p=product()
-    if not p: return "❌ محصول موردنظر پیدا نشد."
-    code,name,desc,pr,days,_,_=p
-    cursor.execute("SELECT COUNT(*) FROM orders WHERE product=?",(code,)); total=cursor.fetchone()[0]
-    since=(datetime.now()-timedelta(days=RECENT_ORDER_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("SELECT COUNT(*) FROM orders WHERE product=? AND created_at>=?",(code,since)); recent=cursor.fetchone()[0]
-    cursor.execute("SELECT AVG(rating),COUNT(*) FROM reviews WHERE product=?",(code,)); avg,count=cursor.fetchone(); avg=round(avg or 0,1)
-    text=(f"🏪 فروشگاه آنلاین شاپ\nخریدی آسان و مطمئن برای کلیه همشهریان و هموطنان\n\n📦 {code}\n🔹 نام محصول: {name}\n\n📝 توضیحات محصول:\n{desc}\n\n💰 قیمت: {price(pr)} تومان\n\n🛒 تاکنون {total} سفارش برای این محصول ثبت شده است.\n")
-    if recent>=RECENT_ORDER_THRESHOLD: text+="🔥 این محصول اخیراً مورد توجه مشتریان بوده است.\n"
-    return text+f"\n🚚 ارسال رایگان فقط در محدوده شهر {FREE_DELIVERY_CITY}\n⏱ زمان تقریبی ارسال: {days} روز کاری\n\n💵 پرداخت درب منزل پس از رویت و تحویل کالا\n\n⭐ امتیاز مشتریان: {avg} / 5\n💬 تعداد نظر ثبت شده: {count}\n\nبرای ثبت سفارش روی دکمه زیر بزنید."
-
-async def show_product(chat_id):
-    p=product()
-    if not p: return await bot.send_message(chat_id=chat_id,text="❌ محصولی برای نمایش وجود ندارد.")
-    text=build_product_text(); path=p[5]; fid=p[6]
+async def show_product(chat_id, code):
+    p = get_product(code)
+    if not p:
+        return await bot.send_message(chat_id=chat_id, text="❌ محصول موجود نیست.", chat_keypad=main_menu(), chat_keypad_type="New")
+    text = build_product_text(code)
+    path = p["image_path"]
+    fid = p["image_file_id"]
+    keypad = product_menu(code)
     if path and os.path.exists(path):
         try:
-            await bot.send_image(chat_id=chat_id,path=path,text=text,chat_keypad=product_menu(),chat_keypad_type="New"); return
-        except Exception as e: print("IMAGE ERROR",e)
+            return await bot.send_image(chat_id=chat_id, path=path, text=text, chat_keypad=keypad, chat_keypad_type="New")
+        except Exception as exc:
+            print("IMAGE ERROR:", exc)
     if fid:
         try:
-            await bot.send_image(chat_id=chat_id,file_id=fid,text=text,chat_keypad=product_menu(),chat_keypad_type="New"); return
-        except Exception as e: print("FILE IMAGE ERROR",e)
-    await bot.send_message(chat_id=chat_id,text="⚠️ تصویر محصول ثبت نشده است.\n\n"+text,chat_keypad=product_menu(),chat_keypad_type="New")
+            return await bot.send_image(chat_id=chat_id, file_id=fid, text=text, chat_keypad=keypad, chat_keypad_type="New")
+        except Exception as exc:
+            print("FILE IMAGE ERROR:", exc)
+    return await bot.send_message(chat_id=chat_id, text="⚠️ تصویر محصول ثبت نشده است.\n\n" + text, chat_keypad=keypad, chat_keypad_type="New")
+
 
 def policy_text():
-    return ("📜 شرایط خدمات پس از فروش\n\n"
-      f"1️⃣ مشتری هنگام تحویل کالا آن را رویت و بررسی می‌کند.\n\n"
-      f"2️⃣ پس از تأیید دریافت، مهلت عادی تعویض/مرجوعی {RETURN_WINDOW_HOURS} ساعت است.\n\n"
-      f"3️⃣ درخواست تعویض تا {EXCHANGE_WINDOW_HOURS} ساعت پس از تأیید دریافت قابل ثبت است.\n\n"
-      "4️⃣ درخواست توسط مدیر بررسی و نتیجه به مشتری اعلام می‌شود.\n\n"
-      "5️⃣ در صورت تأیید مرجوعی، اطلاعات بانکی مشتری دریافت و پس از بررسی مدیر، وضعیت واریز ثبت می‌شود.\n\n"
-      "6️⃣ دکمه خدمات پس از فروش ممکن است پس از پایان مهلت نیز دیده شود، اما درخواست جدید پذیرفته نمی‌شود.")
+    return (
+        "📜 شرایط فروش و خدمات پس از فروش\n\n"
+        "🏠 پرداخت درب منزل پس از رویت و تحویل کالا.\n\n"
+        f"🚚 ارسال رایگان فقط در محدوده شهر {FREE_DELIVERY_CITY}.\n\n"
+        "📦 ارسال به سایر نقاط کشور با احتساب هزینه پستی.\n\n"
+        f"1️⃣ مهلت عادی تعویض/مرجوعی: {RETURN_WINDOW_HOURS} ساعت پس از تأیید دریافت.\n\n"
+        f"2️⃣ مهلت درخواست تعویض: {EXCHANGE_WINDOW_HOURS} ساعت پس از تأیید دریافت.\n\n"
+        "3️⃣ درخواست توسط مدیر بررسی و نتیجه در روبیکا به مشتری اعلام می‌شود.\n\n"
+        "4️⃣ در صورت مرجوعی، اطلاعات بانکی دریافت و پس از تأیید مدیر، وجه واریز می‌شود."
+    )
 
-async def notify_customer_status(oid,status):
-    cursor.execute("SELECT chat_id,name,product FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-    if r and r[0]:
-        await bot.send_message(chat_id=r[0],text=f"📢 وضعیت سفارش #{oid} تغییر کرد.\n\n📦 محصول: {r[2]}\n📌 وضعیت: {status_fa(status)}")
+# ============================================================
+# NOTIFICATIONS / WEBSITE SYNC
+# ============================================================
+async def notify_customer_status(oid, status):
+    conn = get_db()
+    row = conn.execute("SELECT chat_id,name,product FROM orders WHERE id=?", (oid,)).fetchone()
+    conn.close()
+    if row and row["chat_id"]:
+        await bot.send_message(
+            chat_id=row["chat_id"],
+            text=f"📢 وضعیت سفارش #{oid} تغییر کرد.\n\n📦 محصول: {row['product']}\n📌 وضعیت: {status_fa(status)}"
+        )
+
+
 async def notify_admin_order(oid):
-    cursor.execute("SELECT name,phone,address,product,status FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-    if not r:return
-    await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"🆕 سفارش جدید #{oid}\n\n👤 نام: {r[0]}\n📱 تلفن: {r[1]}\n📍 آدرس: {r[2]}\n📦 محصول: {r[3]}\n📌 وضعیت: {status_fa(r[4])}",chat_keypad=order_admin_menu(oid),chat_keypad_type="New")
+    conn = get_db()
+    row = conn.execute("SELECT name,phone,address,product,status FROM orders WHERE id=?", (oid,)).fetchone()
+    conn.close()
+    if not row:
+        return
+    await bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=(f"🆕 سفارش جدید #{oid}\n\n👤 نام: {row['name']}\n📱 تلفن: {row['phone']}\n"
+              f"📍 آدرس: {row['address']}\n📦 محصول: {row['product']}\n📌 وضعیت: {status_fa(row['status'])}"),
+        chat_keypad=order_admin_menu(oid),
+        chat_keypad_type="New"
+    )
+
+
+def website_sync_worker():
+    print("WEBSITE ORDER SYNC STARTED")
+    while True:
+        try:
+            with urllib.request.urlopen(WEBSITE_API_URL, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+            for w in orders:
+                wid = w.get("id")
+                if wid is None:
+                    continue
+                conn = get_db()
+                if conn.execute("SELECT id FROM orders WHERE website_order_id=?", (int(wid),)).fetchone():
+                    conn.close()
+                    continue
+
+                product_code = str(w.get("product_code") or "-")
+                product = conn.execute("SELECT name FROM products WHERE code=?", (product_code,)).fetchone()
+                product_name = f"{product_code} | {product['name']}" if product else product_code
+
+                ref = str(w.get("customer_ref") or "")
+                chat_id = ""
+                if ref:
+                    try:
+                        padded = ref + "=" * (-len(ref) % 4)
+                        chat_id = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+                    except Exception:
+                        chat_id = ""
+
+                address = f"{w.get('province') or '-'}، {w.get('city') or '-'}، {w.get('address') or '-'}"
+                cur = conn.execute("""
+                    INSERT INTO orders(
+                        website_order_id,website_customer_ref,user_id,product,name,phone,province,city,address,status,chat_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    int(wid), ref, f"website:{wid}", product_name,
+                    str(w.get("fullname") or "-"), str(w.get("phone") or "-"),
+                    str(w.get("province") or "-"), str(w.get("city") or "-"), address,
+                    str(w.get("status") or "جدید"), chat_id,
+                    str(w.get("created_at") or now_string())
+                ))
+                oid = cur.lastrowid
+                conn.commit()
+                conn.close()
+                print(f"WEBSITE ORDER IMPORTED: website #{wid} -> bot #{oid}")
+
+                try:
+                    loop = BOT_LOOP
+                    if loop and not loop.is_closed():
+                        future = asyncio.run_coroutine_threadsafe(notify_admin_order(oid), loop)
+                        future.result(timeout=15)
+                except Exception as exc:
+                    print("WEBSITE ADMIN NOTIFICATION ERROR:", exc)
+
+        except Exception as exc:
+            print("WEBSITE SYNC ERROR:", exc)
+        import time
+        time.sleep(WEBSITE_SYNC_INTERVAL)
+
+# ============================================================
+# AFTER SALES
+# ============================================================
 async def notify_after_sales(rid):
-    cursor.execute("""SELECT r.order_id,r.request_type,r.reason,r.status,r.user_id,o.name,o.phone,o.address,o.product,r.refund_amount,r.exchange_product,r.card_number,r.iban,r.bank_name,r.exchange_delivery_days FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=?""",(rid,))
-    x=cursor.fetchone()
-    if not x:
-        print("AFTER SALES NOTIFICATION ERROR: request not found", rid)
+    conn = get_db()
+    row = conn.execute("""
+        SELECT r.order_id,r.request_type,r.reason,r.status,o.name,o.phone,o.address,o.product,
+               r.refund_amount,r.exchange_product,r.card_number,r.iban,r.bank_name,r.exchange_delivery_days
+        FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=?
+    """, (rid,)).fetchone()
+    conn.close()
+    if not row:
         return False
-    oid,typ,reason,st,uid,name,phone,address,prod,amount,exprod,card,iban,bank_name,days=x
-    text=(f"🔔 درخواست خدمات پس از فروش #{rid}\n\n"
-          f"🧾 سفارش: #{oid}\n"
-          f"👤 مشتری: {name}\n"
-          f"📱 تلفن: {phone}\n"
-          f"📍 آدرس: {address}\n"
-          f"📦 محصول: {prod}\n"
-          f"🔄 نوع درخواست: {typ}\n"
-          f"📝 دلیل: {reason}\n"
-          f"💰 مبلغ: {price(amount)} تومان\n"
-          f"🔁 کالای جایگزین: {exprod or '-'}\n"
-          f"💳 کارت: {card or '-'}\n"
-          f"🏦 شبا: {iban or '-'}\n"
-          f"🏦 بانک: {bank_name or '-'}\n"
-          f"📌 وضعیت: {after_status(st)}")
-    # Send the notification text separately from the management keypad. This prevents a
-    # keypad validation error from blocking the actual request notification.
+    text = (
+        f"🔔 درخواست خدمات پس از فروش #{rid}\n\n"
+        f"🧾 سفارش: #{row['order_id']}\n👤 مشتری: {row['name']}\n📱 تلفن: {row['phone']}\n"
+        f"📍 آدرس: {row['address']}\n📦 محصول: {row['product']}\n"
+        f"🔄 نوع درخواست: {row['request_type']}\n📝 دلیل: {row['reason']}\n"
+        f"💰 مبلغ: {price(row['refund_amount'])} تومان\n💳 کارت: {row['card_number'] or '-'}\n"
+        f"🏦 شبا: {row['iban'] or '-'}\n🏦 بانک: {row['bank_name'] or '-'}\n"
+        f"📌 وضعیت: {after_status(row['status'])}"
+    )
     try:
-        await bot.send_message(chat_id=ADMIN_CHAT_ID,text=text)
-        print("AFTER SALES ADMIN TEXT SENT", rid)
-    except Exception as e:
-        print("AFTER SALES ADMIN TEXT ERROR:", type(e).__name__, e)
-        return False
-    try:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"🎛 مدیریت درخواست #{rid} — {typ}\nوضعیت فعلی: {after_status(st)}\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-            chat_keypad=return_admin_menu(rid,typ,st),
+            text=f"🎛 مدیریت درخواست #{rid}\nوضعیت: {after_status(row['status'])}",
+            chat_keypad=return_admin_menu(rid, row['request_type'], row['status']),
             chat_keypad_type="New"
         )
-        print("AFTER SALES ADMIN CONTROL SENT", rid)
-    except Exception as e:
-        print("AFTER SALES ADMIN CONTROL ERROR:", type(e).__name__, e)
-        # Text has already reached the manager; report the control-keypad problem in CMD.
-    return True
+        return True
+    except Exception as exc:
+        print("AFTER SALES NOTIFICATION ERROR:", exc)
+        return False
+
 
 async def notify_customer_after(rid):
-    cursor.execute("SELECT r.order_id,r.request_type,r.status,r.admin_note,r.user_id,o.chat_id,r.exchange_delivery_days,r.exchange_round FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=?",(rid,)); r=cursor.fetchone()
-    if not r or not r[5]: return
-    oid,typ,st,note,uid,cid,days,round_no=r
-    text=f"📢 وضعیت درخواست #{rid} برای سفارش #{oid}\n\n🔄 نوع: {typ}\n📌 وضعیت: {after_status(st)}\n📝 توضیح: {note or '-'}"
-    if typ=="تعویض" and st=="در حال تعویض":
-        text += f"\n\n📦 درخواست تعویض شما تأیید شد.\n⏱ زمان تقریبی ارسال کالای تعویضی: {days or '-'} روز کاری\n\nپس از ارسال کالا، دکمه تأیید دریافت برای شما فعال می‌شود."
-    elif typ=="تعویض" and st=="کالای تعویضی ارسال شد":
-        text += "\n\n🚚 کالای تعویضی ارسال شد.\nلطفاً پس از دریافت و بررسی، دریافت کالای تعویضی را تأیید کنید."
-    elif typ=="تعویض" and st=="تعویض انجام شد":
-        text += "\n\n✅ تعویض این سفارش با موفقیت تکمیل شد.\nلطفاً از منوی بعدی رضایت خود را ثبت کنید یا در صورت نارضایتی درخواست تعویض مجدد/مرجوعی بدهید."
-    elif typ=="مرجوعی و بازگشت وجه" and st=="در انتظار واریز":
-        text += "\n\n✅ درخواست مرجوعی شما توسط مدیر تأیید شد.\n💰 مبلغ کالا حداکثر تا ۱ روز کاری به حساب اعلام‌شده واریز خواهد شد.\n\nپس از انجام واریز، پیام دیگری برای تأیید دریافت وجه برای شما ارسال می‌شود."
-    elif typ=="مرجوعی و بازگشت وجه" and st=="وجه واریز شد":
-        text += "\n\n💰 وجه کالا واریز شده است.\nلطفاً پس از بررسی حساب خود، دریافت وجه را تأیید کنید."
-    elif typ=="مرجوعی و بازگشت وجه" and st=="تکمیل شده":
-        text += "\n\n🙏 دریافت وجه شما با موفقیت تأیید شد. درخواست مرجوعی تکمیل گردید."
-    if typ=="تعویض" and st=="کالای تعویضی ارسال شد":
-        await bot.send_message(chat_id=cid,text=text,chat_keypad=exchange_accept_menu(rid),chat_keypad_type="New")
-    elif typ=="مرجوعی و بازگشت وجه" and st=="وجه واریز شد":
-        await bot.send_message(chat_id=cid,text=text,chat_keypad=refund_accept_menu(rid),chat_keypad_type="New")
+    conn = get_db()
+    row = conn.execute("""
+        SELECT r.order_id,r.request_type,r.status,r.admin_note,o.chat_id,r.exchange_delivery_days
+        FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=?
+    """, (rid,)).fetchone()
+    conn.close()
+    if not row or not row["chat_id"]:
+        return
+    text = (
+        f"📢 وضعیت درخواست #{rid} برای سفارش #{row['order_id']}\n\n"
+        f"🔄 نوع: {row['request_type']}\n📌 وضعیت: {after_status(row['status'])}\n"
+        f"📝 توضیح: {row['admin_note'] or '-'}"
+    )
+    if row["request_type"] == "تعویض" and row["status"] == "در حال تعویض":
+        text += f"\n\n📦 درخواست تعویض تأیید شد.\n⏱ زمان تقریبی ارسال: {row['exchange_delivery_days'] or '-'} روز کاری."
+    elif row["request_type"] == "مرجوعی و بازگشت وجه" and row["status"] == "در انتظار واریز":
+        text += "\n\n💰 درخواست مرجوعی تأیید شد. پس از واریز واقعی، پیام تأیید دریافت وجه برای شما ارسال می‌شود."
+    elif row["request_type"] == "مرجوعی و بازگشت وجه" and row["status"] == "وجه واریز شد":
+        text += "\n\n💰 وجه واریز شده است. لطفاً دریافت وجه را تأیید کنید."
+    elif row["request_type"] == "تعویض" and row["status"] == "کالای تعویضی ارسال شد":
+        text += "\n\n📦 کالای تعویضی ارسال شده است. لطفاً پس از دریافت، آن را تأیید کنید."
+
+    if row["request_type"] == "مرجوعی و بازگشت وجه" and row["status"] == "وجه واریز شد":
+        await bot.send_message(chat_id=row["chat_id"], text=text, chat_keypad=refund_accept_menu(rid), chat_keypad_type="New")
+    elif row["request_type"] == "تعویض" and row["status"] == "کالای تعویضی ارسال شد":
+        await bot.send_message(chat_id=row["chat_id"], text=text, chat_keypad=exchange_accept_menu(rid), chat_keypad_type="New")
     else:
-        await bot.send_message(chat_id=cid,text=text)
+        await bot.send_message(chat_id=row["chat_id"], text=text)
 
-def export_excel(chat_id):
+# ============================================================
+# EXCEL
+# ============================================================
+async def export_excel(chat_id):
     if not OPENPYXL_AVAILABLE:
-        return bot.send_message(chat_id=chat_id,text="❌ openpyxl نصب نیست. دستور: pip install openpyxl")
-    path="orders_export.xlsx"; wb=Workbook(); ws=wb.active; ws.title="Orders"
-    headers=["شماره سفارش","کاربر","محصول","نام","تلفن","آدرس","وضعیت","ثبت","تحویل","تأیید دریافت","امتیاز","نظر"]
-    ws.append(headers)
-    cursor.execute("""SELECT o.id,o.user_id,o.product,o.name,o.phone,o.address,o.status,o.created_at,o.delivered_at,o.accepted_at,rv.rating,rv.comment FROM orders o LEFT JOIN reviews rv ON rv.order_id=o.id ORDER BY o.id DESC""")
-    for row in cursor.fetchall(): ws.append(list(row))
-    ws2=wb.create_sheet("AfterSales"); ws2.append(["شناسه درخواست","سفارش","کاربر","نوع","دلیل","وضعیت","مبلغ","کارت","شبا","بانک","کالای جایگزین","ثبت","تصمیم","واریز"])
-    cursor.execute("SELECT id,order_id,user_id,request_type,reason,status,refund_amount,card_number,iban,bank_name,exchange_product,created_at,decided_at,paid_at FROM return_requests ORDER BY id DESC")
-    for row in cursor.fetchall(): ws2.append(list(row))
-    for sh in wb.worksheets:
-        for c in sh[1]: c.font=Font(bold=True); c.alignment=Alignment(horizontal="center")
-        for col in sh.columns:
-            sh.column_dimensions[col[0].column_letter].width=min(max(max(len(str(x.value or "")) for x in col)+2,10),35)
-    wb.save(path)
-    return bot.send_document(chat_id=chat_id,path=path,caption="📊 گزارش کامل سفارش‌ها و خدمات پس از فروش")
+        return await bot.send_message(chat_id=chat_id, text="❌ openpyxl نصب نیست.\n\npip install openpyxl")
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orders_export.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Orders"
+        ws.append([
+            "شماره سفارش", "شناسه کاربر", "شناسه روبیکا", "محصول", "نام مشتری", "تلفن",
+            "استان", "شهر", "آدرس", "وضعیت", "تاریخ ثبت", "تاریخ تحویل", "تأیید دریافت", "امتیاز", "نظر"
+        ])
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT o.id,o.user_id,o.chat_id,o.product,o.name,o.phone,o.province,o.city,o.address,
+                   o.status,o.created_at,o.delivered_at,o.customer_acceptance,rv.rating,rv.comment
+            FROM orders o LEFT JOIN reviews rv ON rv.order_id=o.id ORDER BY o.id DESC
+        """).fetchall()
+        for row in rows:
+            ws.append(list(row))
 
-async def show_my_orders(message):
-    uid=get_user_id(message); cid=get_chat_id(message)
-    cursor.execute("SELECT id,product,status,created_at,accepted_at FROM orders WHERE user_id=? ORDER BY id DESC",(uid,)); rows=cursor.fetchall()
-    if not rows:return await bot.send_message(chat_id=cid,text="📋 هنوز سفارشی برای شما ثبت نشده است.",chat_keypad=main_menu(),chat_keypad_type="New")
-    for oid,prod,st,created,accepted in rows:
-        txt=f"🧾 سفارش #{oid}\n📦 محصول: {prod}\n📌 وضعیت: {status_fa(st)}\n📅 ثبت: {created or '-'}"
-        keypad=None
-        if st=="تحویل و تأیید شده":
-            d=deadline(accepted)
-            exchange_deadline=deadline(accepted,EXCHANGE_WINDOW_HOURS)
-            if exchange_deadline and datetime.now()<=exchange_deadline: keypad=customer_after_menu(oid)
-            else: txt+=f"\n⏰ مهلت تعویض تا: {exchange_deadline.strftime('%Y-%m-%d %H:%M:%S') if exchange_deadline else '-'}"
-            cursor.execute("SELECT id,status,request_type FROM return_requests WHERE order_id=?",(oid,)); rr=cursor.fetchone()
-            if rr: txt+=f"\n\n🔄 درخواست خدمات پس از فروش: #{rr[0]}\n📌 {after_status(rr[1])}\nنوع: {rr[2]}"
-        cursor.execute("SELECT id,status,request_type,exchange_delivery_days FROM return_requests WHERE order_id=?",(oid,)); rr=cursor.fetchone()
-        if rr and rr[1]=="کالای تعویضی ارسال شد":
-            txt += f"\n\n🚚 کالای تعویضی ارسال شده است.\n⏱ زمان تقریبی تحویل: {rr[3] or '-'} روز کاری"
-            keypad = exchange_accept_menu(rr[0])
-        elif rr and rr[1]=="تعویض انجام شد":
-            txt += "\n\n✅ تعویض انجام شده است. از منوی رضایت/خدمات پس از فروش اقدام کنید."
-            keypad = customer_after_menu(oid, exchange=True)
-        if keypad:
-            await bot.send_message(chat_id=cid,text=txt,chat_keypad=keypad,chat_keypad_type="New")
-        else:
-            await bot.send_message(chat_id=cid,text=txt)
+        ws2 = wb.create_sheet("AfterSales")
+        ws2.append([
+            "شناسه درخواست", "شماره سفارش", "شناسه کاربر", "نوع", "دلیل", "وضعیت",
+            "مبلغ بازگشت", "کارت", "شبا", "بانک", "کالای جایگزین", "تاریخ ثبت", "تصمیم", "واریز"
+        ])
+        rows2 = conn.execute("""
+            SELECT id,order_id,user_id,request_type,reason,status,refund_amount,card_number,iban,
+                   bank_name,exchange_product,created_at,decided_at,paid_at
+            FROM return_requests ORDER BY id DESC
+        """).fetchall()
+        for row in rows2:
+            ws2.append(list(row))
 
+        ws3 = wb.create_sheet("Products")
+        ws3.append(["کد", "نام", "دسته", "قیمت", "زمان ارسال", "فعال", "تعداد سفارش", "امتیاز", "تعداد نظر"])
+        products = conn.execute("""
+            SELECT p.code,p.name,c.name,p.price,p.delivery_days,p.active,
+                   (SELECT COUNT(*) FROM orders o WHERE o.product=p.code),
+                   (SELECT ROUND(AVG(r.rating),1) FROM reviews r WHERE r.product=p.code),
+                   (SELECT COUNT(*) FROM reviews r2 WHERE r2.product=p.code)
+            FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.id DESC
+        """).fetchall()
+        for row in products:
+            ws3.append(list(row))
+        conn.close()
+
+        for sheet in wb.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for row in sheet.iter_rows():
+                for cell in row:
+                    cell.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+            for column in sheet.columns:
+                letter = column[0].column_letter
+                max_len = max(len(str(c.value or "")) for c in column)
+                sheet.column_dimensions[letter].width = min(max(max_len + 3, 12), 40)
+
+        wb.save(path)
+        await bot.send_document(chat_id=chat_id, path=path, text="📊 گزارش کامل فروشگاه سبلان شاپ", file_name="orders_export.xlsx")
+        print("EXCEL REPORT SENT:", path)
+    except Exception as exc:
+        print("EXCEL ERROR:", exc)
+        await bot.send_message(chat_id=chat_id, text=f"❌ خطا در تهیه گزارش Excel:\n{type(exc).__name__}: {exc}")
+
+# ============================================================
+# ADMIN STATES
+# ============================================================
+def category_list_text():
+    conn = get_db()
+    roots = conn.execute("SELECT id,name,active FROM categories WHERE parent_id IS NULL ORDER BY id").fetchall()
+    lines = ["🗂 دسته‌بندی‌های فروشگاه\n"]
+    for root in roots:
+        lines.append(f"{'🟢' if root['active'] else '🔴'} {root['id']} - {root['name']}")
+        children = conn.execute("SELECT id,name,active FROM categories WHERE parent_id=? ORDER BY id", (root['id'],)).fetchall()
+        for child in children:
+            lines.append(f"   └─ {'🟢' if child['active'] else '🔴'} {child['id']} - {child['name']}")
+    conn.close()
+    return "\n".join(lines)
+
+
+async def admin_product_list(chat_id):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT p.code,p.name,p.price,p.active,c.name AS category
+        FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.id DESC
+    """).fetchall()
+    conn.close()
+    if not rows:
+        return await bot.send_message(chat_id=chat_id, text="📦 محصولی وجود ندارد.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+    for row in rows:
+        keypad = ChatKeypadBuilder().row(
+            ChatKeypadBuilder().button(id=f"admin_edit_product_{row['code']}", text="✏️ ویرایش"),
+            ChatKeypadBuilder().button(id=f"admin_toggle_product_{row['code']}", text="🔄 فعال/غیرفعال")
+        ).row(ChatKeypadBuilder().button(id="admin_products", text="↩️ مدیریت محصولات"), ChatKeypadBuilder().button(id="admin_back", text="🏠 خانه")).build()
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"📦 {row['code']}\nنام: {row['name']}\nدسته: {row['category'] or '-'}\nقیمت: {price(row['price'])} تومان\nوضعیت: {'فعال' if row['active'] else 'غیرفعال'}",
+            chat_keypad=keypad,
+            chat_keypad_type="New"
+        )
+
+
+# ============================================================
+# MESSAGE HANDLER
+# ============================================================
 @bot.on_message()
-async def handle_message(bot_instance: Robot,message: Message):
-    uid=get_user_id(message); cid=get_chat_id(message); text=(getattr(message,"text","") or "").strip()
-    if text=="/start":
-        if cid==ADMIN_CHAT_ID:
-            return await bot.send_message(chat_id=cid,text="👨‍💼 پنل مدیریت فروشگاه",chat_keypad=admin_menu(),chat_keypad_type="New")
-        return await bot.send_message(chat_id=cid,text="🏪 فروشگاه آنلاین شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.",chat_keypad=main_menu(),chat_keypad_type="New")
-    if cid==ADMIN_CHAT_ID and cid in admin_states:
-        state=admin_states[cid]
-        if state=="waiting_image":
-            raw=getattr(message,"raw_data",None) or {}
-            def find_fid(x):
-                if isinstance(x,dict):
-                    for k in ("file_id","fileId"):
-                        if x.get(k): return str(x[k])
-                    for v in x.values():
-                        z=find_fid(v)
-                        if z:return z
-                elif isinstance(x,list):
-                    for v in x:
-                        z=find_fid(v)
-                        if z:return z
-                return None
-            fid=find_fid(raw)
-            if not fid:
-                return await bot.send_message(chat_id=cid,text="❌ شناسه تصویر دریافت نشد. لطفاً عکس را دوباره ارسال کنید.")
-            tmp=PRODUCT_IMAGE_PATH+".new"
-            try:
-                await bot.download(file_id=fid,save_as=tmp,verbose=False)
-                if not os.path.exists(tmp) or os.path.getsize(tmp)<=0: raise RuntimeError("empty image")
-                if os.path.exists(PRODUCT_IMAGE_PATH): os.remove(PRODUCT_IMAGE_PATH)
-                os.replace(tmp,PRODUCT_IMAGE_PATH)
-                cursor.execute("UPDATE products SET image_path=?,image_file_id=NULL WHERE code=?",(PRODUCT_IMAGE_PATH,PRODUCT_CODE)); conn.commit()
-                admin_states.pop(cid,None)
-                return await bot.send_message(chat_id=cid,text="✅ تصویر محصول با موفقیت تغییر کرد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
-            except Exception as e:
-                print("IMAGE UPDATE ERROR:",repr(e))
-                try:
-                    if os.path.exists(tmp): os.remove(tmp)
-                except: pass
-                return await bot.send_message(chat_id=cid,text="❌ ذخیره تصویر انجام نشد. لطفاً دوباره تلاش کنید.")
-        if state.startswith("waiting_"):
-            if text=="لغو": admin_states.pop(cid,None); return await bot.send_message(chat_id=cid,text="❌ عملیات لغو شد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
-            field=state.replace("waiting_","")
-            if field=="price" and not norm(text).isdigit(): return await bot.send_message(chat_id=cid,text="❌ قیمت باید فقط عدد باشد.")
-            dbfield={"price":"price","name":"name","description":"description","delivery":"delivery_days"}.get(field)
-            if dbfield:
-                cursor.execute(f"UPDATE products SET {dbfield}=? WHERE code=?",(norm(text) if field=="price" else text,PRODUCT_CODE)); conn.commit(); admin_states.pop(cid,None)
-                return await bot.send_message(chat_id=cid,text="✅ اطلاعات محصول تغییر کرد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+async def handle_message(bot_instance: Robot, message: Message):
+    global BOT_LOOP
+    try:
+        BOT_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    uid = get_user_id(message)
+    cid = get_chat_id(message)
+    text = (getattr(message, "text", "") or "").strip()
+
+    if text == "/start":
+        if cid == ADMIN_CHAT_ID:
+            return await bot.send_message(chat_id=cid, text="👨‍💼 پنل مدیریت سبلان شاپ", chat_keypad=admin_menu(), chat_keypad_type="New")
+        return await bot.send_message(chat_id=cid, text="🏪 سبلان شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.", chat_keypad=main_menu(), chat_keypad_type="New")
+
+    # ---------------- ADMIN INPUT STATES ----------------
+    if cid == ADMIN_CHAT_ID and cid in admin_states:
+        state = admin_states[cid]
+
+        if text == "لغو":
+            admin_states.pop(cid, None)
+            return await bot.send_message(chat_id=cid, text="❌ عملیات لغو شد.", chat_keypad=admin_menu(), chat_keypad_type="New")
+
+        if state == "category_name":
+            if not text:
+                return await bot.send_message(chat_id=cid, text="❌ نام دسته نمی‌تواند خالی باشد.")
+            conn = get_db()
+            conn.execute("INSERT INTO categories(parent_id,name,active,created_at) VALUES(NULL,?,1,?)", (text, now_string()))
+            conn.commit(); conn.close(); admin_states.pop(cid, None)
+            return await bot.send_message(chat_id=cid, text="✅ دسته اصلی اضافه شد.", chat_keypad=admin_categories_menu(), chat_keypad_type="New")
+
+        if state == "subcategory_parent":
+            if not norm(text).isdigit():
+                return await bot.send_message(chat_id=cid, text="❌ شناسه دسته اصلی را به صورت عدد وارد کنید.")
+            parent = int(norm(text))
+            conn = get_db(); row = conn.execute("SELECT id,name FROM categories WHERE id=? AND parent_id IS NULL", (parent,)).fetchone(); conn.close()
+            if not row:
+                return await bot.send_message(chat_id=cid, text="❌ دسته اصلی پیدا نشد.")
+            admin_states[cid] = {"state": "subcategory_name", "parent_id": parent}
+            return await bot.send_message(chat_id=cid, text=f"📝 نام زیر‌دسته برای «{row['name']}» را وارد کنید:")
+
+        if isinstance(state, dict) and state.get("state") == "subcategory_name":
+            parent = state["parent_id"]
+            conn = get_db(); conn.execute("INSERT INTO categories(parent_id,name,active,created_at) VALUES(?,?,1,?)", (parent,text,now_string())); conn.commit(); conn.close()
+            admin_states.pop(cid, None)
+            return await bot.send_message(chat_id=cid, text="✅ زیر‌دسته اضافه شد.", chat_keypad=admin_categories_menu(), chat_keypad_type="New")
+
+        if isinstance(state, dict) and state.get("state") == "product_add":
+            step = state.get("step")
+            if step == "code":
+                code = text.upper()
+                conn = get_db(); exists = conn.execute("SELECT id FROM products WHERE code=?", (code,)).fetchone(); conn.close()
+                if exists:
+                    return await bot.send_message(chat_id=cid, text="❌ این کد محصول قبلاً وجود دارد. کد دیگری وارد کنید.")
+                state.update(step="name", code=code)
+                return await bot.send_message(chat_id=cid, text="📝 نام محصول:")
+            if step == "name":
+                state.update(step="description", name=text); return await bot.send_message(chat_id=cid, text="📄 توضیحات محصول:")
+            if step == "description":
+                state.update(step="price", description=text); return await bot.send_message(chat_id=cid, text="💰 قیمت به تومان:")
+            if step == "price":
+                if not norm(text).isdigit(): return await bot.send_message(chat_id=cid, text="❌ قیمت باید عدد باشد.")
+                state.update(step="delivery", price=norm(text)); return await bot.send_message(chat_id=cid, text="⏱ زمان ارسال (مثلاً 1 تا 3):")
+            if step == "delivery":
+                state.update(step="category", delivery=text)
+                conn = get_db(); rows = conn.execute("SELECT id,name,parent_id FROM categories WHERE active=1 ORDER BY parent_id,id").fetchall(); conn.close()
+                lines = ["🗂 شناسه دسته یا زیر‌دسته را وارد کنید:\n"] + [f"{r['id']} - {r['name']}" + (" (زیر‌دسته)" if r['parent_id'] else "") for r in rows]
+                return await bot.send_message(chat_id=cid, text="\n".join(lines))
+            if step == "category":
+                if not norm(text).isdigit(): return await bot.send_message(chat_id=cid, text="❌ شناسه دسته باید عدد باشد.")
+                cat = int(norm(text)); conn = get_db(); exists = conn.execute("SELECT id FROM categories WHERE id=? AND active=1", (cat,)).fetchone()
+                if not exists: conn.close(); return await bot.send_message(chat_id=cid, text="❌ دسته پیدا نشد.")
+                state.update(step="image", category_id=cat); conn.close()
+                return await bot.send_message(chat_id=cid, text="🖼 تصویر محصول را ارسال کنید. اگر تصویر ندارید، بنویسید: بدون تصویر")
+            if step == "image":
+                image_path = ""
+                if text != "بدون تصویر":
+                    raw = getattr(message, "raw_data", None) or {}
+                    def find_fid(obj):
+                        if isinstance(obj, dict):
+                            for key in ("file_id", "fileId"):
+                                if obj.get(key): return str(obj[key])
+                            for value in obj.values():
+                                found = find_fid(value)
+                                if found: return found
+                        elif isinstance(obj, list):
+                            for value in obj:
+                                found = find_fid(value)
+                                if found: return found
+                        return None
+                    fid = find_fid(raw)
+                    if fid:
+                        filename = f"product_{state['code']}.jpg"
+                        try:
+                            await bot.download(file_id=fid, save_as=filename, verbose=False)
+                            image_path = filename
+                        except Exception:
+                            image_path = ""
+                conn = get_db()
+                conn.execute("""
+                    INSERT INTO products(code,name,description,price,delivery_days,image_path,category_id,active,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                """, (state["code"],state["name"],state["description"],state["price"],state["delivery"],image_path,state["category_id"],1,now_string()))
+                conn.commit(); conn.close(); admin_states.pop(cid, None)
+                return await bot.send_message(chat_id=cid, text=f"✅ محصول {state['code']} با موفقیت اضافه شد.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+
+        if isinstance(state, dict) and state.get("state") == "edit_product":
+            code = state["code"]; field = state["field"]
+            conn = get_db()
+            if field == "price":
+                if not norm(text).isdigit(): conn.close(); return await bot.send_message(chat_id=cid, text="❌ قیمت باید عدد باشد.")
+                value = norm(text); dbfield = "price"
+            elif field == "name": value = text; dbfield = "name"
+            elif field == "description": value = text; dbfield = "description"
+            elif field == "delivery": value = text; dbfield = "delivery_days"
+            elif field == "category":
+                if not norm(text).isdigit(): conn.close(); return await bot.send_message(chat_id=cid, text="❌ شناسه دسته باید عدد باشد.")
+                value = int(norm(text)); dbfield = "category_id"
+            else:
+                conn.close(); admin_states.pop(cid,None); return
+            conn.execute(f"UPDATE products SET {dbfield}=? WHERE code=?", (value,code)); conn.commit(); conn.close(); admin_states.pop(cid,None)
+            return await bot.send_message(chat_id=cid, text="✅ محصول به‌روزرسانی شد.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+
+    # ---------------- CUSTOMER MANUAL ORDER STATE ----------------
     if uid in customers:
-        st=customers[uid]
-        if st["step"]=="name": st["name"]=text; st["step"]="phone"; return await bot.send_message(chat_id=cid,text="📱 شماره تماس خود را وارد کنید:")
-        if st["step"]=="phone": st["phone"]=norm(text); st["step"]="address"; return await bot.send_message(chat_id=cid,text="📍 آدرس کامل را وارد کنید:")
-        if st["step"]=="address":
-            st["address"]=text; st["step"]="confirm"
-            return await bot.send_message(chat_id=cid,text=f"🧾 اطلاعات سفارش\n\n👤 {st['name']}\n📱 {st['phone']}\n📍 {st['address']}\n📦 {st['product']}\n\nآیا سفارش تأیید شود؟",chat_keypad=confirm_menu(),chat_keypad_type="New")
+        st = customers[uid]
+        if st["step"] == "name": st["name"] = text; st["step"] = "phone"; return await bot.send_message(chat_id=cid, text="📱 شماره تماس:")
+        if st["step"] == "phone": st["phone"] = norm(text); st["step"] = "address"; return await bot.send_message(chat_id=cid, text="📍 آدرس کامل:")
+        if st["step"] == "address":
+            st["address"] = text; st["step"] = "confirm"
+            return await bot.send_message(chat_id=cid, text=f"🧾 اطلاعات سفارش\n\n👤 {st['name']}\n📱 {st['phone']}\n📍 {st['address']}\n📦 {st['product']}\n\nآیا سفارش تأیید شود؟", chat_keypad=confirm_menu(), chat_keypad_type="New")
+
+    # ---------------- AFTER SALES STATE ----------------
     if uid in after_sales_states:
-        st=after_sales_states[uid]
-        if text=="لغو": after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid,text="❌ عملیات لغو شد.",chat_keypad=main_menu(),chat_keypad_type="New")
-        if st["step"]=="reason_again":
-            st["reason"]=text; rid=st["rid"]; typ=st["type"]
-            if typ=="تعویض":
-                cursor.execute("UPDATE return_requests SET status='در انتظار بررسی مجدد',reason=?,decided_at=NULL,admin_note=NULL,exchange_round=COALESCE(exchange_round,1)+1 WHERE id=?",(text,rid)); conn.commit(); after_sales_states.pop(uid,None)
-                await bot.send_message(chat_id=cid,text=f"✅ درخواست تعویض مجدد #{rid} ثبت شد و برای مدیر ارسال شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_after_sales(rid)
-            st["step"]="bank"
-            return await bot.send_message(chat_id=cid,text="🏦 اطلاعات بازگشت وجه\n\nنام صاحب حساب را وارد کنید:")
-        if st["step"]=="reason":
-            st["reason"]=text; oid=st["order_id"]
-            cursor.execute("SELECT user_id,product,name,phone FROM orders WHERE id=?",(oid,)); o=cursor.fetchone()
-            if not o or o[0]!=uid: after_sales_states.pop(uid,None); return
-            amount=None; cursor.execute("SELECT price FROM products WHERE code=?",(o[1],)); pr=cursor.fetchone(); amount=pr[0] if pr else ""
-            if st["type"]=="تعویض":
-                cursor.execute("INSERT OR IGNORE INTO return_requests(order_id,user_id,product,request_type,reason,status,created_at,return_deadline,customer_name,phone,refund_amount) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(oid,uid,o[1],"تعویض",text,"در انتظار بررسی",now_string(),deadline(st.get("accepted_at") or now_string(),EXCHANGE_WINDOW_HOURS).strftime("%Y-%m-%d %H:%M:%S"),o[2],o[3],amount)); conn.commit()
-                rid=cursor.lastrowid; after_sales_states.pop(uid,None); await bot.send_message(chat_id=cid,text=f"✅ درخواست تعویض #{rid} ثبت شد و برای مدیر ارسال شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_after_sales(rid)
-            st["step"]="bank"; return await bot.send_message(chat_id=cid,text="🏦 اطلاعات بازگشت وجه\n\nنام صاحب حساب را وارد کنید:")
-        if st["step"]=="bank": st["account_name"]=text; st["step"]="card"; return await bot.send_message(chat_id=cid,text="💳 شماره کارت ۱۶ رقمی را وارد کنید:")
-        if st["step"]=="card":
-            c=norm(text).replace("-","").replace(" ","")
-            if len(c)!=16 or not c.isdigit(): return await bot.send_message(chat_id=cid,text="❌ شماره کارت باید ۱۶ رقم باشد.")
-            st["card"]=c; st["step"]="iban"; return await bot.send_message(chat_id=cid,text="🏦 شماره شبا را وارد کنید (مثلاً IR...):")
-        if st["step"]=="iban":
-            iban=norm(text).replace(" ","").upper()
-            if iban.startswith("IR"): iban=iban
-            st["iban"]=iban; st["step"]="bank_name"; return await bot.send_message(chat_id=cid,text="🏦 نام بانک را وارد کنید:")
-        if st["step"]=="bank_name":
-            st["bank_name"]=text; oid=st["order_id"]
-            cursor.execute("SELECT user_id,product,name,phone FROM orders WHERE id=?",(oid,)); o=cursor.fetchone()
-            cursor.execute("SELECT price FROM products WHERE code=?",(o[1],)); pr=cursor.fetchone(); amount=pr[0] if pr else ""
-            # Each order has one active after-sales record in the current database schema.
-            # If a previous exchange record exists, reuse it for the refund request instead of
-            # silently ignoring the INSERT because of the UNIQUE(order_id) constraint.
-            cursor.execute("SELECT id FROM return_requests WHERE order_id=?",(oid,)); existing=cursor.fetchone()
+        st = after_sales_states[uid]
+        if text == "لغو":
+            after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid, text="❌ عملیات لغو شد.", chat_keypad=main_menu(), chat_keypad_type="New")
+        if st["step"] == "reason":
+            st["reason"] = text; oid = st["order_id"]
+            conn = get_db(); order = conn.execute("SELECT user_id,product,name,phone,price FROM orders o LEFT JOIN products p ON p.code=o.product WHERE o.id=?", (oid,)).fetchone(); conn.close()
+            if not order or order["user_id"] != uid:
+                after_sales_states.pop(uid,None); return
+            if st["type"] == "تعویض":
+                conn=get_db(); cur=conn.execute("INSERT OR IGNORE INTO return_requests(order_id,user_id,product,request_type,reason,status,created_at,return_deadline,customer_name,phone,refund_amount) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(oid,uid,order["product"],"تعویض",text,"در انتظار بررسی",now_string(),deadline(st.get("accepted_at") or now_string(),EXCHANGE_WINDOW_HOURS).strftime("%Y-%m-%d %H:%M:%S"),order["name"],order["phone"],order["price"] or "")); rid=cur.lastrowid; conn.commit(); conn.close(); after_sales_states.pop(uid,None)
+                await bot.send_message(chat_id=cid,text=f"✅ درخواست تعویض #{rid} ثبت شد و برای مدیر ارسال شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_after_sales(rid)
+            st["step"]="bank"; return await bot.send_message(chat_id=cid,text="🏦 نام صاحب حساب:")
+        if st["step"] == "bank": st["account_name"]=text; st["step"]="card"; return await bot.send_message(chat_id=cid,text="💳 شماره کارت ۱۶ رقمی:")
+        if st["step"] == "card":
+            card=norm(text).replace("-","").replace(" ","")
+            if len(card)!=16 or not card.isdigit(): return await bot.send_message(chat_id=cid,text="❌ شماره کارت باید ۱۶ رقم باشد.")
+            st["card"]=card; st["step"]="iban"; return await bot.send_message(chat_id=cid,text="🏦 شماره شبا (IR...):")
+        if st["step"] == "iban": st["iban"]=norm(text).replace(" ","").upper(); st["step"]="bank_name"; return await bot.send_message(chat_id=cid,text="🏦 نام بانک:")
+        if st["step"] == "bank_name":
+            conn=get_db(); order=conn.execute("SELECT user_id,product,name,phone FROM orders WHERE id=?",(st["order_id"],)).fetchone(); prod=conn.execute("SELECT price FROM products WHERE code=?",(order["product"],)).fetchone() if order else None
+            if not order or order["user_id"] != uid: conn.close(); after_sales_states.pop(uid,None); return
+            existing=conn.execute("SELECT id FROM return_requests WHERE order_id=?",(st["order_id"],)).fetchone()
+            data=(uid,order["product"],"مرجوعی و بازگشت وجه",st["reason"],"در انتظار بررسی",now_string(),deadline(st.get("accepted_at") or now_string(),RETURN_WINDOW_HOURS).strftime("%Y-%m-%d %H:%M:%S"),order["name"],order["phone"],prod[0] if prod else "",st["account_name"],st["card"],st["iban"],text)
             if existing:
+                conn.execute("UPDATE return_requests SET user_id=?,product=?,request_type=?,reason=?,status=?,created_at=?,return_deadline=?,customer_name=?,phone=?,refund_amount=?,bank_account_name=?,card_number=?,iban=?,bank_name=?,decided_at=NULL,admin_note=NULL,paid_at=NULL WHERE id=?", data+(existing[0],))
                 rid=existing[0]
-                cursor.execute("""UPDATE return_requests SET user_id=?,product=?,request_type=?,reason=?,status=?,created_at=?,return_deadline=?,customer_name=?,phone=?,refund_amount=?,bank_account_name=?,card_number=?,iban=?,bank_name=?,decided_at=NULL,admin_note=NULL,paid_at=NULL WHERE id=?""",(uid,o[1],"مرجوعی و بازگشت وجه",st["reason"],"در انتظار بررسی",now_string(),deadline(st.get("accepted_at") or now_string(),RETURN_WINDOW_HOURS).strftime("%Y-%m-%d %H:%M:%S"),o[2],o[3],amount,st["account_name"],st["card"],st["iban"],text,rid))
             else:
-                cursor.execute("INSERT INTO return_requests(order_id,user_id,product,request_type,reason,status,created_at,return_deadline,customer_name,phone,refund_amount,bank_account_name,card_number,iban,bank_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(oid,uid,o[1],"مرجوعی و بازگشت وجه",st["reason"],"در انتظار بررسی",now_string(),deadline(st.get("accepted_at") or now_string(),RETURN_WINDOW_HOURS).strftime("%Y-%m-%d %H:%M:%S"),o[2],o[3],amount,st["account_name"],st["card"],st["iban"],text))
-                rid=cursor.lastrowid
-            conn.commit()
-            after_sales_states.pop(uid,None)
-            sent=await bot.send_message(chat_id=cid,text=f"✅ درخواست بازگشت وجه #{rid} ثبت شد و برای مدیر ارسال شد.",chat_keypad=main_menu(),chat_keypad_type="New")
-            ok=await notify_after_sales(rid)
-            if not ok:
-                await bot.send_message(chat_id=cid,text="⚠️ درخواست شما در سامانه ثبت شد، اما ارسال اعلان به مدیر با خطا مواجه شد. مدیر می‌تواند درخواست را از پنل خدمات پس از فروش مشاهده کند.")
-            return
+                cur=conn.execute("INSERT INTO return_requests(order_id,user_id,product,request_type,reason,status,created_at,return_deadline,customer_name,phone,refund_amount,bank_account_name,card_number,iban,bank_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(st["order_id"],)+data); rid=cur.lastrowid
+            conn.commit(); conn.close(); after_sales_states.pop(uid,None)
+            await bot.send_message(chat_id=cid,text=f"✅ درخواست مرجوعی #{rid} ثبت شد و برای مدیر ارسال شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_after_sales(rid)
+
     if rating_comments.get(uid):
-        data=rating_comments.pop(uid); cursor.execute("INSERT INTO reviews(order_id,user_id,product,rating,comment,created_at) VALUES(?,?,?,?,?,?)",(data["order_id"],uid,data["product"],data["rating"],"" if text=="بدون نظر" else text,now_string())); conn.commit(); return await bot.send_message(chat_id=cid,text="🙏 ممنون از ثبت نظر شما.",chat_keypad=main_menu(),chat_keypad_type="New")
+        data=rating_comments.pop(uid); conn=get_db(); conn.execute("INSERT INTO reviews(order_id,user_id,product,rating,comment,created_at) VALUES(?,?,?,?,?,?)",(data["order_id"],uid,data["product"],data["rating"],"" if text=="بدون نظر" else text,now_string())); conn.commit(); conn.close(); return await bot.send_message(chat_id=cid,text="🙏 ممنون از ثبت نظر شما.",chat_keypad=main_menu(),chat_keypad_type="New")
 
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
 @bot.on_callback()
-async def handle_callback(bot_instance: Robot,message: Message):
+async def handle_callback(bot_instance: Robot, message: Message):
     bid=button_id(message); uid=get_user_id(message); cid=get_chat_id(message)
-    if not bid:return
-    if bid.startswith("admin_"):
-        if not is_admin(message):return
-        if bid=="admin_back": return await bot.send_message(chat_id=cid,text="👨‍💼 پنل مدیریت فروشگاه",chat_keypad=admin_menu(),chat_keypad_type="New")
-        if bid=="admin_customer_panel":
-            return await bot.send_message(
-                chat_id=cid,
-                text="👤 بخش امور مشتریان و سفارش‌ها\n\nاز این قسمت سفارش‌ها، خدمات پس از فروش و گزارش Excel را مدیریت کنید.",
-                chat_keypad=admin_customer_menu(),
-                chat_keypad_type="New"
-            )
-        if bid=="admin_products": return await bot.send_message(chat_id=cid,text="🛠 مدیریت محصولات",chat_keypad=admin_products_menu(),chat_keypad_type="New")
-        if bid=="admin_after_sales":
-            cursor.execute("SELECT id,order_id,request_type,status FROM return_requests WHERE status NOT IN ('تکمیل شده','تعویض انجام شد','وجه واریز شد','رد شده') ORDER BY id DESC")
-            rows=cursor.fetchall()
-            if not rows:return await bot.send_message(chat_id=cid,text="✅ درخواست باز خدمات پس از فروش وجود ندارد.",chat_keypad=admin_menu(),chat_keypad_type="New")
-            for rid,oid,typ,st in rows: await bot.send_message(chat_id=cid,text=f"🔄 درخواست #{rid}\n🧾 سفارش #{oid}\nنوع: {typ}\nوضعیت: {after_status(st)}",chat_keypad=return_admin_menu(rid,typ,st),chat_keypad_type="New")
-            return
-        if bid=="admin_export_orders": return await export_excel(cid)
-        if bid=="admin_orders":
-            cursor.execute("SELECT id,name,product,status FROM orders ORDER BY id DESC LIMIT 20")
-            rows=cursor.fetchall(); txt="📋 آخرین سفارش‌ها\n\n"+"\n".join(f"#{r[0]} | {r[1]} | {r[2]} | {status_fa(r[3])}" for r in rows) if rows else "📋 سفارشی وجود ندارد."
-            return await bot.send_message(chat_id=cid,text=txt,chat_keypad=admin_menu(),chat_keypad_type="New")
-        if bid in ("admin_price_P-001","admin_name_P-001","admin_description_P-001","admin_delivery_P-001"):
-            admin_states[cid]="waiting_"+bid.replace("admin_","").replace("_P-001","")
-            return await bot.send_message(chat_id=cid,text="✏️ مقدار جدید را در پیام بعدی ارسال کنید. برای لغو: لغو")
-        if bid=="admin_image_P-001":
-            admin_states[cid]="waiting_image"
-            return await bot.send_message(chat_id=cid,text="🖼 تصویر جدید محصول را به صورت عکس ارسال کنید.\nبرای لغو: لغو")
-        if bid=="admin_toggle_P-001":
-            p=admin_product(); new=0 if p[7] else 1; cursor.execute("UPDATE products SET active=? WHERE code=?",(new,PRODUCT_CODE)); conn.commit(); return await bot.send_message(chat_id=cid,text="✅ وضعیت محصول تغییر کرد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
-        if bid=="admin_product_info_P-001":
-            p=admin_product(); return await bot.send_message(chat_id=cid,text=f"📋 {p[0]}\nنام: {p[1]}\nتوضیحات: {p[2]}\nقیمت: {price(p[3])} تومان\nارسال: {p[4]} روز کاری\nوضعیت: {'فعال' if p[7] else 'غیرفعال'}",chat_keypad=admin_products_menu(),chat_keypad_type="New")
-        if bid.startswith("admin_confirm_"):
-            oid=int(bid.split("_")[-1]); cursor.execute("UPDATE orders SET status='تأیید شده' WHERE id=?",(oid,)); conn.commit(); await bot.send_message(chat_id=cid,text=f"✅ سفارش #{oid} تأیید شد."); return await notify_customer_status(oid,"تأیید شده")
-        if bid.startswith("admin_cancel_"):
-            oid=int(bid.split("_")[-1]); cursor.execute("UPDATE orders SET status='لغو شده' WHERE id=?",(oid,)); conn.commit(); await bot.send_message(chat_id=cid,text=f"❌ سفارش #{oid} لغو شد."); return await notify_customer_status(oid,"لغو شده")
-        if bid.startswith("admin_deliver_"):
-            oid=int(bid.split("_")[-1]); cursor.execute("SELECT chat_id,name,product FROM orders WHERE id=?",(oid,)); r=cursor.fetchone();
-            if not r:return
-            cursor.execute("UPDATE orders SET status='تحویل شده',delivered_at=? WHERE id=?",(now_string(),oid)); conn.commit(); await bot.send_message(chat_id=cid,text=f"🚚 سفارش #{oid} تحویل شد."); return await bot.send_message(chat_id=r[0],text=f"سلام {r[1]} عزیز 🌷\n\n📦 سفارش #{oid} تحویل شما شده است. پس از رویت و بررسی، دریافت کالا را تأیید کنید.",chat_keypad=accept_menu(oid),chat_keypad_type="New")
-        if bid.startswith("admin_refund_paid_"):
-            rid=int(bid.split("_")[-1])
-            cursor.execute("SELECT status FROM return_requests WHERE id=? AND request_type='مرجوعی و بازگشت وجه'",(rid,)); r=cursor.fetchone()
-            if not r or r[0]!="در انتظار واریز": return
-            cursor.execute("UPDATE return_requests SET status='وجه واریز شد',paid_at=?,decided_at=? WHERE id=?",(now_string(),now_string(),rid)); conn.commit()
-            await bot.send_message(chat_id=cid,text=f"✅ واریز درخواست #{rid} ثبت شد.")
-            return await notify_customer_after(rid)
-        if bid.startswith("admin_exchange_sent_"):
-            rid=int(bid.split("_")[-1])
-            cursor.execute("SELECT status FROM return_requests WHERE id=? AND request_type='تعویض'",(rid,)); r=cursor.fetchone()
-            if not r or r[0]!="در حال تعویض": return
-            cursor.execute("UPDATE return_requests SET status='کالای تعویضی ارسال شد',exchange_sent_at=?,decided_at=? WHERE id=?",(now_string(),now_string(),rid)); conn.commit()
-            await bot.send_message(chat_id=cid,text=f"📦 ارسال کالای تعویضی برای درخواست #{rid} ثبت شد.")
-            return await notify_customer_after(rid)
-        if bid.startswith("admin_exchange_done_"):
-            rid=int(bid.split("_")[-1])
-            cursor.execute("SELECT status FROM return_requests WHERE id=? AND request_type='تعویض'",(rid,)); r=cursor.fetchone()
-            if not r or r[0]!="در انتظار تأیید دریافت تعویضی": return
-            cursor.execute("UPDATE return_requests SET status='تعویض انجام شد',decided_at=? WHERE id=?",(now_string(),rid)); conn.commit()
-            await bot.send_message(chat_id=cid,text=f"✅ تعویض نهایی درخواست #{rid} ثبت شد.")
-            return await notify_customer_after(rid)
-        if bid.startswith("admin_after_approve_") or bid.startswith("admin_after_reject_"):
-            rid=int(bid.split("_")[-1]); approve="approve" in bid
-            cursor.execute("SELECT order_id,status,request_type FROM return_requests WHERE id=?",(rid,)); r=cursor.fetchone()
-            if not r:return
-            new="رد شده" if not approve else ("در انتظار واریز" if r[2]=="مرجوعی و بازگشت وجه" else "در حال تعویض")
-            if approve and r[2]=="تعویض":
-                cursor.execute("UPDATE return_requests SET status=?,decided_at=?,admin_note=?,exchange_delivery_days=? WHERE id=?",(new,now_string(),"درخواست تعویض توسط مدیر تأیید شد؛ منتظر ارسال کالای تعویضی.","2 تا 3",rid))
-            else:
-                cursor.execute("UPDATE return_requests SET status=?,decided_at=?,admin_note=? WHERE id=?",(new,now_string(),"درخواست توسط مدیر تأیید شد." if approve else "درخواست توسط مدیر رد شد.",rid))
-            conn.commit()
-            await bot.send_message(chat_id=cid,text=f"{'✅' if approve else '❌'} درخواست #{rid} بررسی شد.")
-            # After approval, always send a fresh admin control message for the next step.
-            if approve and r[2] == "تعویض":
-                await bot.send_message(
-                    chat_id=cid,
-                    text=(f"📦 درخواست تعویض #{rid} تأیید شد.\n\n"
-                          f"⏱ زمان تقریبی ارسال کالای تعویضی: 2 تا 3 روز کاری\n\n"
-                          "پس از آماده شدن و ارسال کالا، دکمه زیر را بزنید:"),
-                    chat_keypad=return_admin_menu(rid, "تعویض", "در حال تعویض"),
-                    chat_keypad_type="New"
-                )
-            elif approve and r[2] == "مرجوعی و بازگشت وجه":
-                await bot.send_message(
-                    chat_id=cid,
-                    text=(f"💰 درخواست مرجوعی #{rid} تأیید شد.\n\n"
-                          "⏱ مبلغ کالا حداکثر تا ۱ روز کاری به حساب مشتری واریز خواهد شد.\n\n"
-                          "پس از انجام واقعی واریز، دکمه زیر را بزنید تا پیام تأیید دریافت وجه برای مشتری ارسال شود:"),
-                    chat_keypad=return_admin_menu(rid, "مرجوعی و بازگشت وجه", "در انتظار واریز"),
-                    chat_keypad_type="New"
-                )
-            return await notify_customer_after(rid)
-        return
-    if bid=="main_menu":
-        customers.pop(uid,None); after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid,text="🏪 فروشگاه آنلاین شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.",chat_keypad=main_menu(),chat_keypad_type="New")
-    if bid=="show_products": return await show_product(cid)
-    if bid=="shop_policy": return await bot.send_message(chat_id=cid,text=policy_text(),chat_keypad=main_menu(),chat_keypad_type="New")
-    if bid=="my_orders": return await show_my_orders(message)
-    if bid=="order_product_P-001":
-        if not product(): return await bot.send_message(chat_id=cid,text="❌ محصول موجود نیست.")
-        customers[uid]={"step":"name","product":PRODUCT_CODE,"name":"","phone":"","address":""}; return await bot.send_message(chat_id=cid,text="🛒 ثبت سفارش\n\nنام و نام خانوادگی خود را وارد کنید:")
-    if bid=="customer_confirm_order":
-        st=customers.get(uid)
-        if not st or st.get("step")!="confirm":return
-        cursor.execute("INSERT INTO orders(user_id,product,name,phone,address,status,chat_id,created_at) VALUES(?,?,?,?,?,?,?,?)",(uid,st["product"],st["name"],st["phone"],st["address"],"جدید",cid,now_string())); conn.commit(); oid=cursor.lastrowid; customers.pop(uid,None); await bot.send_message(chat_id=cid,text=f"✅ سفارش #{oid} با موفقیت ثبت شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_admin_order(oid)
-    if bid=="customer_cancel_order": customers.pop(uid,None); return await bot.send_message(chat_id=cid,text="❌ سفارش لغو شد.",chat_keypad=main_menu(),chat_keypad_type="New")
-    if bid.startswith("customer_accept_delivery_"):
-        oid=int(bid.split("_")[-1]); cursor.execute("SELECT user_id,status FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-        if not r or r[0]!=uid or r[1]!="تحویل شده":return
-        accepted=now_string(); cursor.execute("UPDATE orders SET status='تحویل و تأیید شده',accepted_at=?,customer_acceptance=? WHERE id=?",(accepted,"مشتری کالا را رویت و سالم و مطابق سفارش تحویل گرفته است.",oid)); conn.commit(); d=deadline(accepted); await bot.send_message(chat_id=cid,text=f"✅ دریافت سفارش #{oid} ثبت شد.\n\n⏰ مهلت خدمات پس از فروش عادی تا: {d.strftime('%Y-%m-%d %H:%M:%S')}",chat_keypad=customer_after_menu(oid),chat_keypad_type="New"); await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"📦 مشتری دریافت سفارش #{oid} را تأیید کرد."); return
-    if bid.startswith("customer_accept_refund_"):
-        rid=int(bid.split("_")[-1])
-        cursor.execute("SELECT r.order_id,r.user_id,r.status,o.chat_id FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=? AND r.request_type='مرجوعی و بازگشت وجه'",(rid,)); r=cursor.fetchone()
-        if not r or r[1]!=uid or r[2]!="وجه واریز شد": return
-        cursor.execute("UPDATE return_requests SET status='تکمیل شده',decided_at=?,admin_note=? WHERE id=?",(now_string(),"مشتری دریافت وجه را تأیید کرد.",rid)); conn.commit()
-        oid=r[0]
-        cursor.execute("UPDATE orders SET status='مرجوع و وجه بازگشت داده شد' WHERE id=?",(oid,)); conn.commit()
-        await bot.send_message(chat_id=cid,text=f"✅ دریافت وجه درخواست #{rid} ثبت شد.\n\n🙏 ممنون از تأیید شما؛ فرآیند مرجوعی و بازگشت وجه تکمیل شد.",chat_keypad=main_menu(),chat_keypad_type="New")
-        await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"💰 مشتری دریافت وجه درخواست #{rid} برای سفارش #{oid} را تأیید کرد.")
-        return
-    if bid.startswith("customer_accept_exchange_"):
-        rid=int(bid.split("_")[-1])
-        cursor.execute("SELECT r.order_id,r.user_id,r.status,o.chat_id FROM return_requests r JOIN orders o ON o.id=r.order_id WHERE r.id=? AND r.request_type='تعویض'",(rid,)); r=cursor.fetchone()
-        if not r or r[1]!=uid or r[2]!="کالای تعویضی ارسال شد": return
-        cursor.execute("UPDATE return_requests SET status='تعویض انجام شد',exchange_received_at=?,exchange_customer_acceptance=?,decided_at=? WHERE id=?",(now_string(),"مشتری کالای تعویضی را دریافت و تأیید کرد.",now_string(),rid)); conn.commit()
-        oid=r[0]
-        cursor.execute("UPDATE orders SET status='تعویض انجام شد' WHERE id=?",(oid,)); conn.commit()
-        await bot.send_message(chat_id=cid,text=f"✅ دریافت کالای تعویضی درخواست #{rid} ثبت شد.\n\nاکنون رضایت خود را اعلام کنید.",chat_keypad=customer_after_menu(oid, exchange=True),chat_keypad_type="New")
-        await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"📦 مشتری دریافت کالای تعویضی درخواست #{rid} را تأیید کرد.",chat_keypad=return_admin_menu(rid,"تعویض","در انتظار تأیید دریافت تعویضی"),chat_keypad_type="New")
-        return
-    if bid.startswith("customer_exchange_") or bid.startswith("customer_refund_"):
-        oid=int(bid.split("_")[-1]); typ="تعویض" if bid.startswith("customer_exchange_") else "مرجوعی و بازگشت وجه"
-        cursor.execute("SELECT user_id,status,accepted_at FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-        if not r or r[0]!=uid or r[1] not in ("تحویل و تأیید شده","تعویض انجام شد"):return
-        cursor.execute("SELECT id,status,request_type FROM return_requests WHERE order_id=?",(oid,)); ex=cursor.fetchone()
-        if r[1]=="تحویل و تأیید شده":
-            d=deadline(r[2],EXCHANGE_WINDOW_HOURS if typ=="تعویض" else RETURN_WINDOW_HOURS)
-            if not d or datetime.now()>d:return await bot.send_message(chat_id=cid,text="⏰ مهلت ثبت این درخواست به پایان رسیده است.")
-        if r[1]=="تعویض انجام شد" and not ex: return
-        if ex and ex[1] not in ("تعویض انجام شد", "رد شده") and r[1]=="تحویل و تأیید شده":
-            return await bot.send_message(chat_id=cid,text=f"⚠️ برای این سفارش قبلاً درخواست #{ex[0]} ثبت شده است.\nوضعیت: {after_status(ex[1])}")
-        if ex and r[1]=="تعویض انجام شد":
-            after_sales_states[uid]={"step":"reason_again","order_id":oid,"type":typ,"accepted_at":r[2],"rid":ex[0]}
-            return await bot.send_message(chat_id=cid,text=f"🔄 درخواست {typ} مجدد\n\nدلیل درخواست را کامل بنویسید:\n\nبرای لغو: لغو")
-        after_sales_states[uid]={"step":"reason","order_id":oid,"type":typ,"accepted_at":r[2]}; return await bot.send_message(chat_id=cid,text=f"🔄 درخواست {typ}\n\nدلیل درخواست را کامل بنویسید:\n\nبرای لغو: لغو")
-    if bid.startswith("customer_rate_"):
-        oid=int(bid.split("_")[-1])
-        cursor.execute("SELECT user_id,status FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-        if not r or r[0]!=uid or r[1] not in ("تحویل و تأیید شده","تعویض انجام شد"): return
-        cursor.execute("SELECT id FROM reviews WHERE order_id=?",(oid,))
-        if cursor.fetchone():
-            return await bot.send_message(chat_id=cid,text="⭐ امتیاز و نظر این سفارش قبلاً ثبت شده است.",chat_keypad=main_menu(),chat_keypad_type="New")
-        return await bot.send_message(chat_id=cid,text=f"⭐ لطفاً میزان رضایت خود از سفارش #{oid} را انتخاب کنید:",chat_keypad=rating_menu(oid),chat_keypad_type="New")
-    if bid.startswith("rating_"):
-        parts=bid.split("_"); oid=int(parts[1]); rating=int(parts[2]); cursor.execute("SELECT user_id,product,status FROM orders WHERE id=?",(oid,)); r=cursor.fetchone()
-        if not r or r[0]!=uid or r[2] not in ("تحویل و تأیید شده","تعویض انجام شد"):return
-        cursor.execute("SELECT id FROM reviews WHERE order_id=?",(oid,));
-        if cursor.fetchone():return
-        rating_comments[uid]={"order_id":oid,"product":r[1],"rating":rating}; return await bot.send_message(chat_id=cid,text=f"⭐ امتیاز {rating} از 5 ثبت شد.\n\n📝 اگر مایل هستید نظر خود را درباره کالا بنویسید.\nاگر نظری ندارید، بنویسید: بدون نظر")
+    if not bid: return
 
-print("BOT STARTING...")
-bot.run()
+    # ---------------- ADMIN ----------------
+    if bid.startswith("admin_"):
+        if not is_admin(message): return
+        if bid == "admin_back": return await bot.send_message(chat_id=cid,text="🏠 پنل اصلی مدیریت",chat_keypad=admin_menu(),chat_keypad_type="New")
+        if bid == "admin_customer_panel": return await bot.send_message(chat_id=cid,text="👤 امور مشتریان و سفارش‌ها",chat_keypad=admin_customer_menu(),chat_keypad_type="New")
+        if bid == "admin_categories": return await bot.send_message(chat_id=cid,text="🗂 مدیریت دسته‌بندی‌ها",chat_keypad=admin_categories_menu(),chat_keypad_type="New")
+        if bid == "admin_products": return await bot.send_message(chat_id=cid,text="📦 مدیریت محصولات",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+        if bid == "admin_category_add": admin_states[cid]="category_name"; return await bot.send_message(chat_id=cid,text="📝 نام دسته اصلی را وارد کنید:\nبرای لغو: لغو")
+        if bid == "admin_subcategory_add": admin_states[cid]="subcategory_parent"; return await bot.send_message(chat_id=cid,text=category_list_text()+"\n\n📝 شناسه دسته اصلی را وارد کنید:")
+        if bid == "admin_category_list": return await bot.send_message(chat_id=cid,text=category_list_text(),chat_keypad=admin_categories_menu(),chat_keypad_type="New")
+        if bid == "admin_product_add": admin_states[cid]={"state":"product_add","step":"code"}; return await bot.send_message(chat_id=cid,text="🔢 کد محصول جدید (مثلاً P-002):")
+        if bid == "admin_product_list": return await admin_product_list(cid)
+        if bid.startswith("admin_toggle_product_"):
+            code=bid.replace("admin_toggle_product_",""); conn=get_db(); row=conn.execute("SELECT active FROM products WHERE code=?",(code,)).fetchone()
+            if row: conn.execute("UPDATE products SET active=? WHERE code=?",(0 if row[0] else 1,code)); conn.commit()
+            conn.close(); return await bot.send_message(chat_id=cid,text="✅ وضعیت محصول تغییر کرد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+        if bid.startswith("admin_edit_product_"):
+            code=bid.replace("admin_edit_product_","")
+            keypad=ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"admin_edit_field_name_{code}",text="📝 نام"),ChatKeypadBuilder().button(id=f"admin_edit_field_price_{code}",text="💰 قیمت")).row(ChatKeypadBuilder().button(id=f"admin_edit_field_description_{code}",text="📄 توضیحات"),ChatKeypadBuilder().button(id=f"admin_edit_field_delivery_{code}",text="⏱ ارسال")).row(ChatKeypadBuilder().button(id=f"admin_edit_field_category_{code}",text="🗂 دسته")).row(ChatKeypadBuilder().button(id="admin_products",text="↩️ محصولات"),ChatKeypadBuilder().button(id="admin_back",text="🏠 خانه")).build()
+            return await bot.send_message(chat_id=cid,text=f"✏️ ویرایش {code}\nلطفاً بخش موردنظر را انتخاب کنید.",chat_keypad=keypad,chat_keypad_type="New")
+        if bid.startswith("admin_edit_field_"):
+            parts=bid.split("_"); field=parts[3]; code="_".join(parts[4:]); admin_states[cid]={"state":"edit_product","field":field,"code":code}
+            prompt={"name":"نام جدید:","price":"قیمت جدید:","description":"توضیحات جدید:","delivery":"زمان ارسال جدید:","category":"شناسه دسته/زیر‌دسته جدید:"}.get(field,"مقدار جدید:")
+            return await bot.send_message(chat_id=cid,text=prompt+"\n\nبرای لغو: لغو")
+        if bid == "admin_export_orders": return await export_excel(cid)
+        if bid == "admin_orders":
+            conn=get_db(); rows=conn.execute("SELECT id,name,product,status FROM orders ORDER BY id DESC LIMIT 30").fetchall(); conn.close()
+            text="📋 آخرین سفارش‌ها\n\n"+"\n".join(f"#{r['id']} | {r['name']} | {r['product']} | {status_fa(r['status'])}" for r in rows) if rows else "📋 سفارشی وجود ندارد."
+            return await bot.send_message(chat_id=cid,text=text,chat_keypad=admin_customer_menu(),chat_keypad_type="New")
+        if bid == "admin_after_sales":
+            conn=get_db(); rows=conn.execute("SELECT id,order_id,request_type,status FROM return_requests WHERE status NOT IN ('تکمیل شده','تعویض انجام شد','وجه واریز شد','رد شده') ORDER BY id DESC").fetchall(); conn.close()
+            if not rows: return await bot.send_message(chat_id=cid,text="✅ درخواست باز خدمات پس از فروش وجود ندارد.",chat_keypad=admin_customer_menu(),chat_keypad_type="New")
+            for r in rows: await bot.send_message(chat_id=cid,text=f"🔄 درخواست #{r['id']}\n🧾 سفارش #{r['order_id']}\nنوع: {r['request_type']}\nوضعیت: {after_status(r['status'])}",chat_keypad=return_admin_menu(r['id'],r['request_type'],r['status']),chat_keypad_type="New")
+            return
+        if bid.startswith("admin_confirm_"):
+            oid=int(bid.split("_")[-1]); conn=get_db(); conn.execute("UPDATE orders SET status='تأیید شده' WHERE id=?",(oid,)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"✅ سفارش #{oid} تأیید شد."); return await notify_customer_status(oid,"تأیید شده")
+        if bid.startswith("admin_cancel_"):
+            oid=int(bid.split("_")[-1]); conn=get_db(); conn.execute("UPDATE orders SET status='لغو شده' WHERE id=?",(oid,)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"❌ سفارش #{oid} لغو شد."); return await notify_customer_status(oid,"لغو شده")
+        if bid.startswith("admin_deliver_"):
+            oid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT chat_id,name FROM orders WHERE id=?",(oid,)).fetchone()
+            if not row: conn.close(); return
+            conn.execute("UPDATE orders SET status='تحویل شده',delivered_at=? WHERE id=?",(now_string(),oid)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"🚚 سفارش #{oid} تحویل شد."); return await bot.send_message(chat_id=row['chat_id'],text=f"سلام {row['name']} عزیز 🌷\n\n📦 سفارش #{oid} تحویل شما شده است. پس از رویت و بررسی، دریافت کالا را تأیید کنید.",chat_keypad=accept_menu(oid),chat_keypad_type="New")
+        if bid.startswith("admin_after_approve_") or bid.startswith("admin_after_reject_"):
+            rid=int(bid.split("_")[-1]); approve="approve" in bid; conn=get_db(); row=conn.execute("SELECT order_id,request_type FROM return_requests WHERE id=?",(rid,)).fetchone()
+            if not row: conn.close(); return
+            if approve: new_status="در انتظار واریز" if row['request_type']=="مرجوعی و بازگشت وجه" else "در حال تعویض"
+            else: new_status="رد شده"
+            note="درخواست توسط مدیر تأیید شد." if approve else "درخواست توسط مدیر رد شد."
+            conn.execute("UPDATE return_requests SET status=?,decided_at=?,admin_note=?,exchange_delivery_days=? WHERE id=?",(new_status,now_string(),note,"2 تا 3" if row['request_type']=="تعویض" and approve else None,rid)); conn.commit(); conn.close()
+            await bot.send_message(chat_id=cid,text=f"{'✅' if approve else '❌'} درخواست #{rid} بررسی شد.")
+            await notify_customer_after(rid); return
+        if bid.startswith("admin_refund_paid_"):
+            rid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT status FROM return_requests WHERE id=? AND request_type='مرجوعی و بازگشت وجه'",(rid,)).fetchone()
+            if not row or row['status']!="در انتظار واریز": conn.close(); return
+            conn.execute("UPDATE return_requests SET status='وجه واریز شد',paid_at=?,decided_at=? WHERE id=?",(now_string(),now_string(),rid)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"✅ واریز درخواست #{rid} ثبت شد."); return await notify_customer_after(rid)
+        if bid.startswith("admin_exchange_sent_"):
+            rid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT status FROM return_requests WHERE id=? AND request_type='تعویض'",(rid,)).fetchone()
+            if not row or row['status']!="در حال تعویض": conn.close(); return
+            conn.execute("UPDATE return_requests SET status='کالای تعویضی ارسال شد',exchange_sent_at=?,decided_at=? WHERE id=?",(now_string(),now_string(),rid)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"📦 ارسال کالای تعویضی درخواست #{rid} ثبت شد."); return await notify_customer_after(rid)
+        return
+
+    # ---------------- CUSTOMER ----------------
+    if bid == "main_menu":
+        customers.pop(uid,None); after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid,text="🏪 سبلان شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.",chat_keypad=main_menu(),chat_keypad_type="New")
+    if bid == "show_categories": return await bot.send_message(chat_id=cid,text="🗂 دسته‌بندی محصولات",chat_keypad=category_menu(),chat_keypad_type="New")
+    if bid.startswith("cat_"):
+        cat_id=int(bid.split("_")[-1]); keypad, rows=products_in_category_menu(cat_id)
+        conn=get_db(); cat=conn.execute("SELECT name FROM categories WHERE id=?",(cat_id,)).fetchone(); conn.close()
+        if rows:
+            return await bot.send_message(chat_id=cid,text=f"📂 {cat['name']}\n\nمحصول موردنظر را انتخاب کنید:",chat_keypad=keypad,chat_keypad_type="New")
+        # Show children when no direct products.
+        return await bot.send_message(chat_id=cid,text=f"📂 {cat['name']}\n\nزیر‌دسته یا محصول را انتخاب کنید:",chat_keypad=category_menu(cat_id),chat_keypad_type="New")
+    if bid.startswith("view_product_"):
+        return await show_product(cid,bid.replace("view_product_",""))
+    if bid.startswith("order_product_"):
+        code=bid.replace("order_product_","")
+        if not get_product(code): return await bot.send_message(chat_id=cid,text="❌ محصول موجود نیست.",chat_keypad=main_menu(),chat_keypad_type="New")
+        link=website_order_link(cid,code)
+        return await bot.send_message(chat_id=cid,text=f"🛒 ادامه فرآیند خرید\n\nمحصول انتخابی: {code}\n\n{link}\n\nشناسه مشتری شما به‌صورت خودکار همراه سفارش منتقل می‌شود.")
+    if bid == "shop_policy": return await bot.send_message(chat_id=cid,text=policy_text(),chat_keypad=main_menu(),chat_keypad_type="New")
+    if bid == "my_orders":
+        conn=get_db(); rows=conn.execute("SELECT id,product,status,created_at,accepted_at FROM orders WHERE user_id=? OR chat_id=? ORDER BY id DESC",(uid,cid)).fetchall(); conn.close()
+        if not rows: return await bot.send_message(chat_id=cid,text="📋 هنوز سفارشی برای شما ثبت نشده است.",chat_keypad=main_menu(),chat_keypad_type="New")
+        for row in rows:
+            text=f"🧾 سفارش #{row['id']}\n📦 {row['product']}\n📌 {status_fa(row['status'])}\n📅 {row['created_at'] or '-'}"
+            keypad=None
+            if row['status']=="تحویل و تأیید شده": keypad=customer_after_menu(row['id'])
+            await bot.send_message(chat_id=cid,text=text,chat_keypad=keypad,chat_keypad_type="New" if keypad else None)
+        return
+    if bid == "customer_confirm_order":
+        st=customers.get(uid)
+        if not st or st.get("step")!="confirm": return
+        conn=get_db(); cur=conn.execute("INSERT INTO orders(user_id,product,name,phone,address,status,chat_id,created_at) VALUES(?,?,?,?,?,?,?,?)",(uid,st['product'],st['name'],st['phone'],st['address'],"جدید",cid,now_string())); oid=cur.lastrowid; conn.commit(); conn.close(); customers.pop(uid,None); await bot.send_message(chat_id=cid,text=f"✅ سفارش #{oid} ثبت شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await notify_admin_order(oid)
+    if bid == "customer_cancel_order": customers.pop(uid,None); return await bot.send_message(chat_id=cid,text="❌ سفارش لغو شد.",chat_keypad=main_menu(),chat_keypad_type="New")
+    if bid.startswith("customer_accept_delivery_"):
+        oid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT user_id,status FROM orders WHERE id=?",(oid,)).fetchone()
+        if not row or row['user_id']!=uid or row['status']!="تحویل شده": conn.close(); return
+        accepted=now_string(); conn.execute("UPDATE orders SET status='تحویل و تأیید شده',accepted_at=?,customer_acceptance=? WHERE id=?",(accepted,"مشتری کالا را رویت و سالم و مطابق سفارش تحویل گرفت.",oid)); conn.commit(); conn.close(); d=deadline(accepted); await bot.send_message(chat_id=cid,text=f"✅ دریافت سفارش #{oid} ثبت شد.\n\n⏰ مهلت خدمات پس از فروش عادی تا: {d.strftime('%Y-%m-%d %H:%M:%S')}",chat_keypad=customer_after_menu(oid),chat_keypad_type="New"); return await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"📦 مشتری دریافت سفارش #{oid} را تأیید کرد.")
+    if bid.startswith("customer_rate_"):
+        oid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT user_id,status,product FROM orders WHERE id=?",(oid,)).fetchone(); already=conn.execute("SELECT id FROM reviews WHERE order_id=?",(oid,)).fetchone(); conn.close()
+        if not row or row['user_id']!=uid or row['status'] not in ("تحویل و تأیید شده","تعویض انجام شد") or already: return
+        return await bot.send_message(chat_id=cid,text=f"⭐ میزان رضایت از سفارش #{oid} را انتخاب کنید:",chat_keypad=rating_menu(oid),chat_keypad_type="New")
+    if bid.startswith("rating_"):
+        parts=bid.split("_"); oid=int(parts[1]); rating=int(parts[2]); conn=get_db(); row=conn.execute("SELECT user_id,product,status FROM orders WHERE id=?",(oid,)).fetchone(); exists=conn.execute("SELECT id FROM reviews WHERE order_id=?",(oid,)).fetchone(); conn.close()
+        if not row or row['user_id']!=uid or row['status'] not in ("تحویل و تأیید شده","تعویض انجام شد") or exists: return
+        rating_comments[uid]={"order_id":oid,"product":row['product'],"rating":rating}; return await bot.send_message(chat_id=cid,text=f"⭐ امتیاز {rating} از 5 ثبت شد.\n\n📝 نظر خود را بنویسید یا بنویسید: بدون نظر")
+    if bid.startswith("customer_accept_refund_"):
+        rid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT order_id,user_id,status FROM return_requests WHERE id=? AND request_type='مرجوعی و بازگشت وجه'",(rid,)).fetchone()
+        if not row or row['user_id']!=uid or row['status']!="وجه واریز شد": conn.close(); return
+        conn.execute("UPDATE return_requests SET status='تکمیل شده',decided_at=?,admin_note=? WHERE id=?",(now_string(),"مشتری دریافت وجه را تأیید کرد.",rid)); conn.execute("UPDATE orders SET status='مرجوع و وجه بازگشت داده شد' WHERE id=?",(row['order_id'],)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"✅ دریافت وجه درخواست #{rid} تأیید شد.",chat_keypad=main_menu(),chat_keypad_type="New"); return await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"💰 مشتری دریافت وجه درخواست #{rid} را تأیید کرد.")
+    if bid.startswith("customer_accept_exchange_"):
+        rid=int(bid.split("_")[-1]); conn=get_db(); row=conn.execute("SELECT order_id,user_id,status FROM return_requests WHERE id=? AND request_type='تعویض'",(rid,)).fetchone()
+        if not row or row['user_id']!=uid or row['status']!="کالای تعویضی ارسال شد": conn.close(); return
+        conn.execute("UPDATE return_requests SET status='تعویض انجام شد',exchange_received_at=?,exchange_customer_acceptance=?,decided_at=? WHERE id=?",(now_string(),"مشتری کالای تعویضی را دریافت و تأیید کرد.",now_string(),rid)); conn.execute("UPDATE orders SET status='تعویض انجام شد' WHERE id=?",(row['order_id'],)); conn.commit(); conn.close(); await bot.send_message(chat_id=cid,text=f"✅ دریافت کالای تعویضی درخواست #{rid} ثبت شد.",chat_keypad=customer_after_menu(row['order_id'],exchange=True),chat_keypad_type="New"); return await bot.send_message(chat_id=ADMIN_CHAT_ID,text=f"📦 مشتری دریافت کالای تعویضی #{rid} را تأیید کرد.")
+    if bid.startswith("customer_exchange_") or bid.startswith("customer_refund_"):
+        oid=int(bid.split("_")[-1]); typ="تعویض" if bid.startswith("customer_exchange_") else "مرجوعی و بازگشت وجه"; conn=get_db(); row=conn.execute("SELECT user_id,status,accepted_at FROM orders WHERE id=?",(oid,)).fetchone(); existing=conn.execute("SELECT id,status FROM return_requests WHERE order_id=?",(oid,)).fetchone(); conn.close()
+        if not row or row['user_id']!=uid or row['status'] not in ("تحویل و تأیید شده","تعویض انجام شد"): return
+        if row['status']=="تحویل و تأیید شده":
+            d=deadline(row['accepted_at'],EXCHANGE_WINDOW_HOURS if typ=="تعویض" else RETURN_WINDOW_HOURS)
+            if not d or datetime.now()>d: return await bot.send_message(chat_id=cid,text="⏰ مهلت ثبت این درخواست به پایان رسیده است.")
+        after_sales_states[uid]={"step":"reason","order_id":oid,"type":typ,"accepted_at":row['accepted_at']}; return await bot.send_message(chat_id=cid,text=f"🔄 درخواست {typ}\n\nدلیل درخواست را کامل بنویسید:\n\nبرای لغو: لغو")
+
+# ============================================================
+# START
+# ============================================================
+if __name__ == "__main__":
+    init_db()
+    print("BOT STARTING...")
+    print("Starting website order synchronization...")
+    threading.Thread(target=website_sync_worker, daemon=True).start()
+    bot.run()
