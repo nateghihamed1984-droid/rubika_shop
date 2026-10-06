@@ -19,8 +19,8 @@ except ImportError:
 # ============================================================
 # SECURITY / CONFIGURATION
 # ============================================================
-TOKEN = "CFFHIC0ZOTGPALAPFBHEWCNUDYSNDTKTENGOAULXCZPLZRSBYTHFVPMKUWLMEPHM"
-ADMIN_CHAT_ID = "b0BC4FX0BHkJ080af57b490e17163d49"
+TOKEN = ""
+ADMIN_CHAT_ID = ""
 
 DB_PATH = "shop.db"
 PRODUCT_IMAGE_PATH = "product_default.jpg"
@@ -453,6 +453,40 @@ def admin_customer_menu():
         .build())
 
 
+def admin_product_category_menu():
+    """انتخاب دسته‌ای که قبلاً در بخش «مدیریت دسته‌بندی‌ها» تعریف شده است."""
+    conn = get_db()
+    roots = conn.execute(
+        "SELECT id,name FROM categories WHERE parent_id IS NULL AND active=1 ORDER BY sort_order,id"
+    ).fetchall()
+    children = conn.execute(
+        "SELECT c.id,c.name,c.parent_id,p.name AS parent_name "
+        "FROM categories c JOIN categories p ON p.id=c.parent_id "
+        "WHERE c.active=1 AND p.active=1 ORDER BY p.sort_order,p.id,c.sort_order,c.id"
+    ).fetchall()
+    conn.close()
+
+    b = ChatKeypadBuilder()
+    if not roots:
+        b.row(ChatKeypadBuilder().button(id="admin_categories", text="🗂 تعریف دسته‌بندی‌ها"))
+    else:
+        for root in roots:
+            b.row(ChatKeypadBuilder().button(
+                id=f"admin_product_add_cat_{root['id']}",
+                text=f"📂 {root['name']}"
+            ))
+            for child in [c for c in children if c['parent_id'] == root['id']]:
+                b.row(ChatKeypadBuilder().button(
+                    id=f"admin_product_add_cat_{child['id']}",
+                    text=f"↳ {child['name']} | {root['name']}"
+                ))
+
+    b.row(ChatKeypadBuilder().button(id="admin_categories", text="🗂 مدیریت دسته‌بندی‌ها"))
+    b.row(ChatKeypadBuilder().button(id="admin_products", text="↩️ مدیریت محصولات"),
+          ChatKeypadBuilder().button(id="admin_back", text="🏠 خانه"))
+    return b.build()
+
+
 def admin_categories_menu():
     return (ChatKeypadBuilder()
         .row(ChatKeypadBuilder().button(id="admin_category_add", text="➕ افزودن دسته اصلی"))
@@ -465,7 +499,10 @@ def admin_categories_menu():
 def admin_products_menu():
     return (ChatKeypadBuilder()
         .row(ChatKeypadBuilder().button(id="admin_product_add", text="➕ افزودن محصول"))
-        .row(ChatKeypadBuilder().button(id="admin_product_list", text="📋 محصولات"))
+        .row(ChatKeypadBuilder().button(id="admin_product_list", text="📋 محصولات فعال"))
+        .row(ChatKeypadBuilder().button(id="admin_inactive_products", text="🚫 محصولات غیرفعال"))
+        .row(ChatKeypadBuilder().button(id="admin_edit_product_select", text="✏️ ویرایش محصول"),
+             ChatKeypadBuilder().button(id="admin_delete_product_select", text="🗑 حذف محصول"))
         .row(ChatKeypadBuilder().button(id="admin_back", text="🏠 بازگشت به صفحه اصلی"))
         .build())
 
@@ -804,22 +841,100 @@ async def admin_product_list(chat_id):
     conn = get_db()
     rows = conn.execute("""
         SELECT p.code,p.name,p.price,p.active,c.name AS category
-        FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.id DESC
+        FROM products p LEFT JOIN categories c ON c.id=p.category_id
+        WHERE p.active=1 ORDER BY p.id DESC
     """).fetchall()
     conn.close()
     if not rows:
-        return await bot.send_message(chat_id=chat_id, text="📦 محصولی وجود ندارد.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+        return await bot.send_message(
+            chat_id=chat_id,
+            text="📦 در حال حاضر محصول فعالی وجود ندارد.",
+            chat_keypad=admin_products_menu(),
+            chat_keypad_type="New"
+        )
+    await bot.send_message(chat_id=chat_id, text="📋 محصولات فعال")
     for row in rows:
-        keypad = ChatKeypadBuilder().row(
-            ChatKeypadBuilder().button(id=f"admin_edit_product_{row['code']}", text="✏️ ویرایش"),
-            ChatKeypadBuilder().button(id=f"admin_toggle_product_{row['code']}", text="🔄 فعال/غیرفعال")
-        ).row(ChatKeypadBuilder().button(id="admin_products", text="↩️ مدیریت محصولات"), ChatKeypadBuilder().button(id="admin_back", text="🏠 خانه")).build()
+        keypad = (ChatKeypadBuilder()
+            .row(
+                ChatKeypadBuilder().button(id=f"admin_toggle_product_{row['code']}", text="🚫 غیرفعال کردن")
+            )
+            .row(
+                ChatKeypadBuilder().button(id=f"admin_edit_product_{row['code']}", text="✏️ ویرایش")
+            )
+            .build())
         await bot.send_message(
             chat_id=chat_id,
-            text=f"📦 {row['code']}\nنام: {row['name']}\nدسته: {row['category'] or '-'}\nقیمت: {price(row['price'])} تومان\nوضعیت: {'فعال' if row['active'] else 'غیرفعال'}",
+            text=(f"📦 {row['code']}\n"
+                  f"نام: {row['name']}\n"
+                  f"دسته: {row['category'] or '-'}\n"
+                  f"قیمت: {price(row['price'])} تومان\n"
+                  "وضعیت: 🟢 فعال"),
             chat_keypad=keypad,
             chat_keypad_type="New"
         )
+    return await bot.send_message(
+        chat_id=chat_id,
+        text="از منوی مدیریت محصولات می‌توانید محصولی را ویرایش، حذف یا غیرفعال کنید.",
+        chat_keypad=admin_products_menu(),
+        chat_keypad_type="New"
+    )
+
+
+async def admin_inactive_product_list(chat_id):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT p.code,p.name,p.price,p.active,c.name AS category
+        FROM products p LEFT JOIN categories c ON c.id=p.category_id
+        WHERE p.active=0 ORDER BY p.id DESC
+    """).fetchall()
+    conn.close()
+    if not rows:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text="🚫 محصول غیرفعالی وجود ندارد.",
+            chat_keypad=admin_products_menu(),
+            chat_keypad_type="New"
+        )
+    await bot.send_message(chat_id=chat_id, text="🚫 محصولات غیرفعال")
+    for row in rows:
+        keypad = (ChatKeypadBuilder()
+            .row(ChatKeypadBuilder().button(id=f"admin_toggle_product_{row['code']}", text="♻️ فعال‌سازی"))
+            .row(ChatKeypadBuilder().button(id=f"admin_edit_product_{row['code']}", text="✏️ ویرایش"),
+                 ChatKeypadBuilder().button(id=f"admin_delete_product_{row['code']}", text="🗑 حذف"))
+            .build())
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(f"📦 {row['code']}\n"
+                  f"نام: {row['name']}\n"
+                  f"دسته: {row['category'] or '-'}\n"
+                  f"قیمت: {price(row['price'])} تومان\n"
+                  "وضعیت: 🔴 غیرفعال"),
+            chat_keypad=keypad,
+            chat_keypad_type="New"
+        )
+    return await bot.send_message(
+        chat_id=chat_id,
+        text="برای بازگشت، از دکمه مدیریت محصولات استفاده کنید.",
+        chat_keypad=admin_products_menu(),
+        chat_keypad_type="New"
+    )
+
+
+async def admin_product_selection(chat_id, action):
+    conn = get_db()
+    rows = conn.execute("SELECT code,name,active FROM products ORDER BY id ASC").fetchall()
+    conn.close()
+    if not rows:
+        return await bot.send_message(chat_id=chat_id, text="📦 هیچ محصولی وجود ندارد.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+    title = "✏️ کدام محصول را می‌خواهید ویرایش کنید؟" if action == "edit" else "🗑 کدام محصول را می‌خواهید حذف کنید؟"
+    builder = ChatKeypadBuilder()
+    for i, row in enumerate(rows, 1):
+        status = "🟢" if row['active'] else "🔴"
+        bid = f"admin_select_edit_{row['code']}" if action == "edit" else f"admin_select_delete_{row['code']}"
+        builder.row(ChatKeypadBuilder().button(id=bid, text=f"{i}️⃣ {status} {row['code']} | {row['name']}"))
+    builder.row(ChatKeypadBuilder().button(id="admin_products", text="↩️ مدیریت محصولات"),
+                ChatKeypadBuilder().button(id="admin_back", text="🏠 خانه"))
+    return await bot.send_message(chat_id=chat_id, text=title, chat_keypad=builder.build(), chat_keypad_type="New")
 
 
 # ============================================================
@@ -874,6 +989,92 @@ async def handle_message(bot_instance: Robot, message: Message):
             admin_states.pop(cid, None)
             return await bot.send_message(chat_id=cid, text="✅ زیر‌دسته اضافه شد.", chat_keypad=admin_categories_menu(), chat_keypad_type="New")
 
+        if state == "product_add_new_root_name":
+            if not text:
+                return await bot.send_message(chat_id=cid, text="❌ نام دسته اصلی نمی‌تواند خالی باشد.")
+            base = admin_states[cid]
+            conn = get_db()
+            exists = conn.execute("SELECT id FROM categories WHERE parent_id IS NULL AND name=?", (text,)).fetchone()
+            if exists:
+                conn.close()
+                return await bot.send_message(chat_id=cid, text="❌ این دسته اصلی قبلاً وجود دارد. از همان دسته قبلی استفاده کنید.", chat_keypad=admin_product_category_menu(), chat_keypad_type="New")
+            cur = conn.execute("INSERT INTO categories(parent_id,name,active,sort_order,created_at) VALUES(NULL,?,1,0,?)", (text, now_string()))
+            parent_id = cur.lastrowid
+            conn.commit(); conn.close()
+            # بعد از ساخت دسته اصلی، حتماً نام زیر‌دسته را می‌گیریم.
+            admin_states[cid] = {
+                "state":"product_add_new_root_sub_name",
+                "parent_id":parent_id,
+                "parent_name":text,
+                "product_code":base["product_code"],
+                "name":base["name"],
+                "description":base["description"],
+                "price":base["price"],
+                "delivery":base["delivery"]
+            }
+            return await bot.send_message(chat_id=cid, text=f"✅ دسته اصلی «{text}» ساخته شد.\n\n📝 حالا نام زیر‌دسته این دسته را وارد کنید:")
+
+        if isinstance(state, dict) and state.get("state") == "product_add_new_root_sub_name":
+            if not text:
+                return await bot.send_message(chat_id=cid, text="❌ نام زیر‌دسته نمی‌تواند خالی باشد.")
+            parent = int(state["parent_id"])
+            conn = get_db()
+            exists = conn.execute("SELECT id FROM categories WHERE parent_id=? AND name=?", (parent, text)).fetchone()
+            parent_row = conn.execute("SELECT id,name,active FROM categories WHERE id=? AND parent_id IS NULL", (parent,)).fetchone()
+            if not parent_row or not parent_row["active"]:
+                conn.close()
+                admin_states.pop(cid, None)
+                return await bot.send_message(chat_id=cid, text="❌ دسته اصلی معتبر نیست.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+            if exists:
+                conn.close()
+                return await bot.send_message(chat_id=cid, text="❌ این زیر‌دسته قبلاً وجود دارد. نام دیگری وارد کنید:")
+            cur = conn.execute("INSERT INTO categories(parent_id,name,active,sort_order,created_at) VALUES(?,?,1,0,?)", (parent,text,now_string()))
+            cat_id = cur.lastrowid
+            conn.commit(); conn.close()
+            admin_states[cid] = {
+                "state":"product_add", "step":"image", "category_id":cat_id,
+                "code":state["product_code"], "name":state["name"],
+                "description":state["description"], "price":state["price"],
+                "delivery":state["delivery"]
+            }
+            return await bot.send_message(chat_id=cid, text=f"✅ زیر‌دسته «{text}» زیرِ «{state['parent_name']}» ساخته و برای محصول انتخاب شد.\n\n🖼 حالا تصویر محصول را ارسال کنید. اگر تصویر ندارید، بنویسید: بدون تصویر")
+
+        if isinstance(state, dict) and state.get("state") == "product_add_new_sub_name":
+            if not text:
+                return await bot.send_message(chat_id=cid, text="❌ نام زیر‌دسته نمی‌تواند خالی باشد.")
+            parent = int(state["parent_id"])
+            conn = get_db()
+            parent_row = conn.execute("SELECT id,name,active FROM categories WHERE id=? AND parent_id IS NULL", (parent,)).fetchone()
+            exists = conn.execute("SELECT id FROM categories WHERE parent_id=? AND name=?", (parent, text)).fetchone()
+            if not parent_row or not parent_row["active"]:
+                conn.close()
+                admin_states.pop(cid, None)
+                return await bot.send_message(chat_id=cid, text="❌ دسته اصلی معتبر نیست.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+            if exists:
+                conn.close()
+                return await bot.send_message(chat_id=cid, text="❌ این زیر‌دسته قبلاً وجود دارد. از همان گزینه قبلی استفاده کنید.", chat_keypad=admin_product_category_menu(), chat_keypad_type="New")
+            cur = conn.execute("INSERT INTO categories(parent_id,name,active,sort_order,created_at) VALUES(?,?,1,0,?)", (parent,text,now_string()))
+            cat_id = cur.lastrowid
+            conn.commit(); conn.close()
+            base = state
+            admin_states[cid] = {"state":"product_add", "step":"image", "category_id":cat_id,
+                                 "code":base["product_code"], "name":base["name"], "description":base["description"],
+                                 "price":base["price"], "delivery":base["delivery"]}
+            return await bot.send_message(chat_id=cid, text=f"✅ زیر‌دسته «{text}» زیرِ «{parent_row['name']}» ساخته و برای محصول انتخاب شد.\n\n🖼 حالا تصویر محصول را ارسال کنید. اگر تصویر ندارید، بنویسید: بدون تصویر")
+
+        if isinstance(state, dict) and state.get("state") == "product_add_new_sub_parent":
+            if not norm(text).isdigit():
+                return await bot.send_message(chat_id=cid, text="❌ شناسه دسته اصلی باید عدد باشد.", chat_keypad=admin_product_category_menu(), chat_keypad_type="New")
+            parent = int(norm(text))
+            conn = get_db(); row = conn.execute("SELECT id,name,active FROM categories WHERE id=? AND parent_id IS NULL", (parent,)).fetchone(); conn.close()
+            if not row or not row["active"]:
+                return await bot.send_message(chat_id=cid, text="❌ دسته اصلی پیدا نشد یا غیرفعال است.", chat_keypad=admin_product_category_menu(), chat_keypad_type="New")
+            base = admin_states[cid]
+            admin_states[cid] = {"state":"product_add_new_sub_name", "parent_id":parent,
+                                 "product_code":base["product_code"], "name":base["name"], "description":base["description"],
+                                 "price":base["price"], "delivery":base["delivery"]}
+            return await bot.send_message(chat_id=cid, text=f"📝 نام زیر‌دسته جدید برای «{row['name']}» را وارد کنید:")
+
         if isinstance(state, dict) and state.get("state") == "product_add":
             step = state.get("step")
             if step == "code":
@@ -881,7 +1082,7 @@ async def handle_message(bot_instance: Robot, message: Message):
                 conn = get_db(); exists = conn.execute("SELECT id FROM products WHERE code=?", (code,)).fetchone(); conn.close()
                 if exists:
                     return await bot.send_message(chat_id=cid, text="❌ این کد محصول قبلاً وجود دارد. کد دیگری وارد کنید.")
-                state.update(step="name", code=code)
+                state.update(step="name", code=code, product_code=code)
                 return await bot.send_message(chat_id=cid, text="📝 نام محصول:")
             if step == "name":
                 state.update(step="description", name=text); return await bot.send_message(chat_id=cid, text="📄 توضیحات محصول:")
@@ -892,14 +1093,36 @@ async def handle_message(bot_instance: Robot, message: Message):
                 state.update(step="delivery", price=norm(text)); return await bot.send_message(chat_id=cid, text="⏱ زمان ارسال (مثلاً 1 تا 3):")
             if step == "delivery":
                 state.update(step="category", delivery=text)
-                conn = get_db(); rows = conn.execute("SELECT id,name,parent_id FROM categories WHERE active=1 ORDER BY parent_id,id").fetchall(); conn.close()
-                lines = ["🗂 شناسه دسته یا زیر‌دسته را وارد کنید:\n"] + [f"{r['id']} - {r['name']}" + (" (زیر‌دسته)" if r['parent_id'] else "") for r in rows]
-                return await bot.send_message(chat_id=cid, text="\n".join(lines))
+                return await bot.send_message(
+                    chat_id=cid,
+                    text="🗂 دسته یا زیر‌دسته محصول را انتخاب کنید.\n\nبرای تعریف دسته جدید، ابتدا به «مدیریت دسته‌بندی‌ها» برگردید.",
+                    chat_keypad=admin_product_category_menu(),
+                    chat_keypad_type="New"
+                )
             if step == "category":
-                if not norm(text).isdigit(): return await bot.send_message(chat_id=cid, text="❌ شناسه دسته باید عدد باشد.")
-                cat = int(norm(text)); conn = get_db(); exists = conn.execute("SELECT id FROM categories WHERE id=? AND active=1", (cat,)).fetchone()
-                if not exists: conn.close(); return await bot.send_message(chat_id=cid, text="❌ دسته پیدا نشد.")
-                state.update(step="image", category_id=cat); conn.close()
+                if not norm(text).isdigit():
+                    return await bot.send_message(
+                        chat_id=cid,
+                        text="❌ لطفاً یکی از دکمه‌های دسته‌بندی را انتخاب کنید یا شناسه عددی معتبر وارد کنید.",
+                        chat_keypad=admin_product_category_menu(),
+                        chat_keypad_type="New"
+                    )
+                cat = int(norm(text))
+                conn = get_db()
+                exists = conn.execute(
+                    "SELECT id FROM categories c LEFT JOIN categories p ON p.id=c.parent_id "
+                    "WHERE c.id=? AND c.active=1 AND (c.parent_id IS NULL OR p.active=1)",
+                    (cat,)
+                ).fetchone()
+                conn.close()
+                if not exists:
+                    return await bot.send_message(
+                        chat_id=cid,
+                        text="❌ دسته پیدا نشد یا غیرفعال است.",
+                        chat_keypad=admin_product_category_menu(),
+                        chat_keypad_type="New"
+                    )
+                state.update(step="image", category_id=cat)
                 return await bot.send_message(chat_id=cid, text="🖼 تصویر محصول را ارسال کنید. اگر تصویر ندارید، بنویسید: بدون تصویر")
             if step == "image":
                 image_path = ""
@@ -1013,16 +1236,102 @@ async def handle_callback(bot_instance: Robot, message: Message):
         if bid == "admin_category_add": admin_states[cid]="category_name"; return await bot.send_message(chat_id=cid,text="📝 نام دسته اصلی را وارد کنید:\nبرای لغو: لغو")
         if bid == "admin_subcategory_add": admin_states[cid]="subcategory_parent"; return await bot.send_message(chat_id=cid,text=category_list_text()+"\n\n📝 شناسه دسته اصلی را وارد کنید:")
         if bid == "admin_category_list": return await bot.send_message(chat_id=cid,text=category_list_text(),chat_keypad=admin_categories_menu(),chat_keypad_type="New")
-        if bid == "admin_product_add": admin_states[cid]={"state":"product_add","step":"code"}; return await bot.send_message(chat_id=cid,text="🔢 کد محصول جدید (مثلاً P-002):")
+        if bid.startswith("admin_product_add_cat_parent_"):
+            parent = int(bid.replace("admin_product_add_cat_parent_", ""))
+            state = admin_states.get(cid)
+            if not isinstance(state, dict) or state.get("state") != "product_add_new_sub_parent":
+                return await bot.send_message(chat_id=cid, text="❌ فرآیند افزودن محصول منقضی شده است.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+            conn=get_db(); row=conn.execute("SELECT id,name,active FROM categories WHERE id=? AND parent_id IS NULL",(parent,)).fetchone(); conn.close()
+            if not row or not row["active"]:
+                return await bot.send_message(chat_id=cid,text="❌ دسته اصلی معتبر نیست.",chat_keypad=admin_categories_menu(),chat_keypad_type="New")
+            state["state"]="product_add_new_sub_name"; state["parent_id"]=parent
+            return await bot.send_message(chat_id=cid,text=f"📝 نام زیر‌دسته جدید برای «{row['name']}» را وارد کنید:\nبرای لغو: لغو")
+        if bid.startswith("admin_product_add_cat_"):
+            cat_id = int(bid.replace("admin_product_add_cat_", ""))
+            state = admin_states.get(cid)
+            if not isinstance(state, dict) or state.get("state") != "product_add":
+                return await bot.send_message(chat_id=cid, text="❌ فرآیند افزودن محصول منقضی شده است.", chat_keypad=admin_products_menu(), chat_keypad_type="New")
+            conn = get_db()
+            valid = conn.execute("SELECT c.id,c.name,c.parent_id FROM categories c LEFT JOIN categories p ON p.id=c.parent_id WHERE c.id=? AND c.active=1 AND (c.parent_id IS NULL OR p.active=1)", (cat_id,)).fetchone()
+            conn.close()
+            if not valid:
+                return await bot.send_message(chat_id=cid, text="❌ این دسته قابل انتخاب نیست.", chat_keypad=admin_product_category_menu(), chat_keypad_type="New")
+            state["step"] = "code"
+            state["category_id"] = cat_id
+            return await bot.send_message(chat_id=cid, text=f"✅ دسته «{valid['name']}» انتخاب شد.\n\n🔢 کد محصول جدید (مثلاً P-002):")
+        if bid == "admin_product_add":
+            admin_states[cid]={"state":"product_add","step":"category"}
+            return await bot.send_message(
+                chat_id=cid,
+                text="🗂 ابتدا دسته یا زیر‌دسته محصول را انتخاب کنید.\n\nاگر دسته موردنظر در فهرست نیست، ابتدا از «مدیریت دسته‌بندی‌ها» آن را تعریف کنید و سپس دوباره افزودن محصول را بزنید.",
+                chat_keypad=admin_product_category_menu(),
+                chat_keypad_type="New"
+            )
         if bid == "admin_product_list": return await admin_product_list(cid)
+        if bid == "admin_inactive_products": return await admin_inactive_product_list(cid)
+        if bid == "admin_edit_product_select": return await admin_product_selection(cid, "edit")
+        if bid == "admin_delete_product_select": return await admin_product_selection(cid, "delete")
         if bid.startswith("admin_toggle_product_"):
-            code=bid.replace("admin_toggle_product_",""); conn=get_db(); row=conn.execute("SELECT active FROM products WHERE code=?",(code,)).fetchone()
-            if row: conn.execute("UPDATE products SET active=? WHERE code=?",(0 if row[0] else 1,code)); conn.commit()
-            conn.close(); return await bot.send_message(chat_id=cid,text="✅ وضعیت محصول تغییر کرد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            code=bid.replace("admin_toggle_product_","")
+            conn=get_db(); row=conn.execute("SELECT active FROM products WHERE code=?",(code,)).fetchone()
+            if not row:
+                conn.close(); return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            new_active=0 if row[0] else 1
+            conn.execute("UPDATE products SET active=? WHERE code=?",(new_active,code)); conn.commit(); conn.close()
+            msg="✅ محصول فعال شد و به لیست محصولات فعال برگشت." if new_active else "🚫 محصول غیرفعال شد و به لیست محصولات غیرفعال منتقل شد."
+            return await bot.send_message(chat_id=cid,text=msg,chat_keypad=admin_products_menu(),chat_keypad_type="New")
+        if bid.startswith("admin_select_edit_"):
+            code=bid.replace("admin_select_edit_","")
+            conn=get_db(); row=conn.execute("SELECT code,name FROM products WHERE code=?",(code,)).fetchone(); conn.close()
+            if not row: return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            # وضعیت محصول را از همان رکوردی که برای انتخاب خوانده‌ایم دریافت می‌کنیم.
+            conn = get_db()
+            current = conn.execute("SELECT active FROM products WHERE code=?", (code,)).fetchone()
+            conn.close()
+            if not current:
+                return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            active = bool(current[0])
+            status_button_id = f"admin_toggle_product_{code}"
+            status_button_text = "🚫 غیرفعال کردن محصول" if active else "♻️ فعال‌سازی محصول"
+            keypad=(ChatKeypadBuilder()
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_name_{code}",text="📝 نام"),ChatKeypadBuilder().button(id=f"admin_edit_field_price_{code}",text="💰 قیمت"))
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_description_{code}",text="📄 توضیحات"),ChatKeypadBuilder().button(id=f"admin_edit_field_delivery_{code}",text="⏱ ارسال"))
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_category_{code}",text="🗂 دسته"))
+                .row(ChatKeypadBuilder().button(id=status_button_id,text=status_button_text))
+                .row(ChatKeypadBuilder().button(id="admin_products",text="↩️ محصولات"),ChatKeypadBuilder().button(id="admin_back",text="🏠 خانه"))
+                .build())
+            status_text = "🟢 فعال" if active else "🔴 غیرفعال"
+            return await bot.send_message(chat_id=cid,text=f"✏️ ویرایش محصول {row['code']}\n{row['name']}\nوضعیت: {status_text}\n\nلطفاً مشخصه موردنظر را انتخاب کنید.",chat_keypad=keypad,chat_keypad_type="New")
+        if bid.startswith("admin_select_delete_"):
+            code=bid.replace("admin_select_delete_","")
+            conn=get_db(); row=conn.execute("SELECT code,name,active FROM products WHERE code=?",(code,)).fetchone(); conn.close()
+            if not row: return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            keypad=ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"admin_confirm_delete_{code}",text="✅ حذف/انتقال به غیرفعال"),ChatKeypadBuilder().button(id="admin_products",text="❌ انصراف")).build()
+            return await bot.send_message(chat_id=cid,text=f"⚠️ حذف محصول\n\nکد: {row['code']}\nنام: {row['name']}\n\nمحصول از لیست فعال خارج و در «محصولات غیرفعال» نگهداری می‌شود تا سوابق سفارش‌ها حفظ شود.\n\nآیا مطمئن هستید؟",chat_keypad=keypad,chat_keypad_type="New")
+        if bid.startswith("admin_confirm_delete_"):
+            code=bid.replace("admin_confirm_delete_","")
+            conn=get_db(); row=conn.execute("SELECT code,name FROM products WHERE code=?",(code,)).fetchone()
+            if not row:
+                conn.close(); return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            conn.execute("UPDATE products SET active=0 WHERE code=?",(code,)); conn.commit(); conn.close()
+            return await bot.send_message(chat_id=cid,text=f"🗑 محصول {code} از لیست فعال حذف و به محصولات غیرفعال منتقل شد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
         if bid.startswith("admin_edit_product_"):
             code=bid.replace("admin_edit_product_","")
-            keypad=ChatKeypadBuilder().row(ChatKeypadBuilder().button(id=f"admin_edit_field_name_{code}",text="📝 نام"),ChatKeypadBuilder().button(id=f"admin_edit_field_price_{code}",text="💰 قیمت")).row(ChatKeypadBuilder().button(id=f"admin_edit_field_description_{code}",text="📄 توضیحات"),ChatKeypadBuilder().button(id=f"admin_edit_field_delivery_{code}",text="⏱ ارسال")).row(ChatKeypadBuilder().button(id=f"admin_edit_field_category_{code}",text="🗂 دسته")).row(ChatKeypadBuilder().button(id="admin_products",text="↩️ محصولات"),ChatKeypadBuilder().button(id="admin_back",text="🏠 خانه")).build()
-            return await bot.send_message(chat_id=cid,text=f"✏️ ویرایش {code}\nلطفاً بخش موردنظر را انتخاب کنید.",chat_keypad=keypad,chat_keypad_type="New")
+            conn=get_db()
+            current=conn.execute("SELECT active FROM products WHERE code=?",(code,)).fetchone()
+            conn.close()
+            if not current:
+                return await bot.send_message(chat_id=cid,text="❌ محصول پیدا نشد.",chat_keypad=admin_products_menu(),chat_keypad_type="New")
+            active=bool(current[0])
+            status_button_text="🚫 غیرفعال کردن محصول" if active else "♻️ فعال‌سازی محصول"
+            keypad=(ChatKeypadBuilder()
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_name_{code}",text="📝 نام"),ChatKeypadBuilder().button(id=f"admin_edit_field_price_{code}",text="💰 قیمت"))
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_description_{code}",text="📄 توضیحات"),ChatKeypadBuilder().button(id=f"admin_edit_field_delivery_{code}",text="⏱ ارسال"))
+                .row(ChatKeypadBuilder().button(id=f"admin_edit_field_category_{code}",text="🗂 دسته"))
+                .row(ChatKeypadBuilder().button(id=f"admin_toggle_product_{code}",text=status_button_text))
+                .row(ChatKeypadBuilder().button(id="admin_products",text="↩️ محصولات"),ChatKeypadBuilder().button(id="admin_back",text="🏠 خانه"))
+                .build())
+            return await bot.send_message(chat_id=cid,text=f"✏️ ویرایش {code}\nوضعیت: {'🟢 فعال' if active else '🔴 غیرفعال'}\n\nلطفاً بخش موردنظر را انتخاب کنید.",chat_keypad=keypad,chat_keypad_type="New")
         if bid.startswith("admin_edit_field_"):
             parts=bid.split("_"); field=parts[3]; code="_".join(parts[4:]); admin_states[cid]={"state":"edit_product","field":field,"code":code}
             prompt={"name":"نام جدید:","price":"قیمت جدید:","description":"توضیحات جدید:","delivery":"زمان ارسال جدید:","category":"شناسه دسته/زیر‌دسته جدید:"}.get(field,"مقدار جدید:")
@@ -1081,7 +1390,18 @@ async def handle_callback(bot_instance: Robot, message: Message):
         code=bid.replace("order_product_","")
         if not get_product(code): return await bot.send_message(chat_id=cid,text="❌ محصول موجود نیست.",chat_keypad=main_menu(),chat_keypad_type="New")
         link=website_order_link(cid,code)
-        return await bot.send_message(chat_id=cid,text=f"🛒 ادامه فرآیند خرید\n\nمحصول انتخابی: {code}\n\n{link}\n\nشناسه مشتری شما به‌صورت خودکار همراه سفارش منتقل می‌شود.")
+        return await bot.send_message(
+            chat_id=cid,
+            text=(
+                f"🛒 ادامه فرآیند خرید\n\n"
+                f"محصول انتخابی: {code}\n\n"
+                "⚠️ به دلیل استفاده از زیرساخت بین‌المللی سایت فروشگاه، "
+                "ممکن است برای باز شدن صفحه فروشگاه نیاز باشد اتصال اینترنت "
+                "خود را از طریق VPN فعال کنید.\n\n"
+                f"🔗 لینک ادامه خرید:\n{link}\n\n"
+                "شناسه مشتری شما به‌صورت خودکار همراه سفارش منتقل می‌شود."
+            )
+        )
     if bid == "shop_policy": return await bot.send_message(chat_id=cid,text=policy_text(),chat_keypad=main_menu(),chat_keypad_type="New")
     if bid == "my_orders":
         conn=get_db(); rows=conn.execute("SELECT id,product,status,created_at,accepted_at FROM orders WHERE user_id=? OR chat_id=? ORDER BY id DESC",(uid,cid)).fetchall(); conn.close()
