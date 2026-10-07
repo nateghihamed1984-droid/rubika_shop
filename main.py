@@ -282,7 +282,7 @@ def make_customer_ref(chat_id):
 
 def website_order_link(chat_id, product_code):
     ref = make_customer_ref(chat_id)
-    return f"{WEBSITE_BASE_URL}landing.html?product={product_code}&customer_ref={ref}"
+    return f"{WEBSITE_BASE_URL}?product={product_code}&customer_ref={ref}"
 
 
 def deadline(accepted, hours=RETURN_WINDOW_HOURS):
@@ -349,16 +349,48 @@ def get_product_stats(code):
 # ============================================================
 def main_menu():
     return (ChatKeypadBuilder()
-        .row(ChatKeypadBuilder().button(id="show_categories", text="🗂 مشاهده دسته‌بندی محصولات"))
+        .row(ChatKeypadBuilder().button(id="show_products", text="📦 مشاهده محصولات"))
         .row(ChatKeypadBuilder().button(id="my_orders", text="📋 سفارش‌های من"),
              ChatKeypadBuilder().button(id="shop_policy", text="📜 شرایط فروش و خدمات پس از فروش"))
         .build())
 
 
+def active_products():
+    conn = get_db()
+    rows = conn.execute("SELECT code FROM products WHERE active=1 ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
+
+
+async def show_all_products(chat_id):
+    rows = active_products()
+    if not rows:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text="📦 در حال حاضر محصول فعالی برای نمایش وجود ندارد.",
+            chat_keypad=main_menu(),
+            chat_keypad_type="New"
+        )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "📦 محصولات سبلان شاپ\n\n"
+            "محصولات فعال فروشگاه به ترتیب نمایش داده می‌شوند.\n"
+            "برای خرید هر محصول، دکمه «🛒 ادامه خرید این محصول» را انتخاب کنید."
+        ),
+        chat_keypad=main_menu(),
+        chat_keypad_type="New"
+    )
+
+    for row in rows:
+        await show_product(chat_id, row["code"])
+
+
 def product_menu(code):
     return (ChatKeypadBuilder()
         .row(ChatKeypadBuilder().button(id=f"order_product_{code}", text="🛒 ادامه خرید این محصول"))
-        .row(ChatKeypadBuilder().button(id="show_categories", text="🗂 سایر محصولات"))
+        .row(ChatKeypadBuilder().button(id="show_products", text="📦 مشاهده سایر محصولات"))
         .row(ChatKeypadBuilder().button(id="main_menu", text="🏠 منوی اصلی"))
         .build())
 
@@ -955,7 +987,7 @@ async def handle_message(bot_instance: Robot, message: Message):
     if text == "/start":
         if cid == ADMIN_CHAT_ID:
             return await bot.send_message(chat_id=cid, text="👨‍💼 پنل مدیریت سبلان شاپ", chat_keypad=admin_menu(), chat_keypad_type="New")
-        return await bot.send_message(chat_id=cid, text="🏪 سبلان شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.", chat_keypad=main_menu(), chat_keypad_type="New")
+        return await bot.send_message(chat_id=cid, text="🏪 به فروشگاه سبلان شاپ خوش آمدید 🌷\n\nلطفاً گزینه مورد نظر را انتخاب کنید.", chat_keypad=main_menu(), chat_keypad_type="New")
 
     # ---------------- ADMIN INPUT STATES ----------------
     if cid == ADMIN_CHAT_ID and cid in admin_states:
@@ -1375,8 +1407,9 @@ async def handle_callback(bot_instance: Robot, message: Message):
 
     # ---------------- CUSTOMER ----------------
     if bid == "main_menu":
-        customers.pop(uid,None); after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid,text="🏪 سبلان شاپ\n\nلطفاً گزینه موردنظر را انتخاب کنید.",chat_keypad=main_menu(),chat_keypad_type="New")
-    if bid == "show_categories": return await bot.send_message(chat_id=cid,text="🗂 دسته‌بندی محصولات",chat_keypad=category_menu(),chat_keypad_type="New")
+        customers.pop(uid,None); after_sales_states.pop(uid,None); return await bot.send_message(chat_id=cid,text="🏪 به فروشگاه سبلان شاپ خوش آمدید 🌷\n\nلطفاً گزینه مورد نظر را انتخاب کنید.",chat_keypad=main_menu(),chat_keypad_type="New")
+    if bid == "show_products": return await show_all_products(cid)
+    if bid == "show_categories": return await show_all_products(cid)
     if bid.startswith("cat_"):
         cat_id=int(bid.split("_")[-1]); keypad, rows=products_in_category_menu(cat_id)
         conn=get_db(); cat=conn.execute("SELECT name FROM categories WHERE id=?",(cat_id,)).fetchone(); conn.close()
